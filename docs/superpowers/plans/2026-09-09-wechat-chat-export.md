@@ -913,7 +913,9 @@ git add tests/fixtures tests/conftest.py wechat_export/db_access.py tests/test_d
 git commit -m "feat: SQLCipher 只读访问（内存解密 + 合成夹具工厂）"
 ```
 
----### Task 6: 数据定位（locator.py）
+---
+
+### Task 6: 数据定位（locator.py）
 
 **Files:**
 - Create: `wechat_export/locator.py`
