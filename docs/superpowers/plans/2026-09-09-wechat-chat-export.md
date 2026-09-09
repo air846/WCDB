@@ -2018,7 +2018,7 @@ def write_session_messages(dir_: Path, session: Session, messages: list[Message]
 
 def write_session_json(dir_: Path, session: Session, counts: dict) -> None:
     _dump_json(Path(dir_) / "session.json",
-               {"session": session.to_dict(), "stats": counts})
+               {**session.to_dict(), "stats": counts})
 
 
 def write_export_meta(out_root: Path, meta: dict) -> None:
