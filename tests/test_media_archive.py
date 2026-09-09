@@ -6,8 +6,8 @@ def test_save_bytes_dedup(tmp_path):
     m1 = arc.save_bytes(b"aaa", "image", ".jpg", md5="m1")
     m2 = arc.save_bytes(b"aaa", "image", ".jpg", md5="m1")
     assert m1.status == "ok"
-    assert m1.rel_path.startswith("image/")
-    assert (tmp_path / "media" / m1.rel_path).exists()
+    assert m1.rel_path.startswith("media/image/")
+    assert (tmp_path / m1.rel_path).exists()
     assert m2.rel_path == m1.rel_path
     s = arc.stats
     assert s["saved"] == 1 and s["duplicated"] == 1 and s["missing"] == 0

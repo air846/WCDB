@@ -18,7 +18,8 @@
               border:1px solid var(--border);border-radius:8px;padding:8px 12px">
     <div class="muted">{{ m.sender.name|e }}</div>
     {% set m_ok = m.media and m.media.status == "ok" %}
-    {% if m_ok and m.media.kind in ("image", "emoji") and m.media.ext not in (".dat",) %}
+    {% set img_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp") %}
+    {% if m_ok and m.media.kind in ("image", "emoji") and m.media.ext in img_exts %}
       <img src="{{ m.media.rel_path }}" onclick="zoom(this)" loading="lazy" alt="图片">
     {% elif m_ok and m.media.kind == "video" %}
       <video src="{{ m.media.rel_path }}" controls preload="metadata"></video>

@@ -37,10 +37,11 @@ class MediaArchive:
         if not kind_dir:
             return None
         digest = md5 or _md5_of_bytes(data)
+        rel_path = f"media/{kind_dir}/{digest}{ext}"
         if digest in self._saved:
             self.stats["duplicated"] += 1
             return Media(kind=kind, md5=digest, size=len(data), ext=ext,
-                         rel_path=f"{kind_dir}/{digest}{ext}")
+                         rel_path=rel_path)
         target_dir = self.media_root / kind_dir
         target_dir.mkdir(parents=True, exist_ok=True)
         tmp = target_dir / f".tmp_{digest}"
@@ -57,7 +58,7 @@ class MediaArchive:
         self._saved.add(digest)
         self.stats["saved"] += 1
         return Media(kind=kind, md5=digest, size=len(data), ext=ext,
-                     rel_path=f"{kind_dir}/{digest}{ext}")
+                     rel_path=rel_path)
 
     def save_bytes(self, data: bytes, kind: str, ext: str, md5: str = "") -> Media:
         media = self._store(data, kind, ext, md5)
