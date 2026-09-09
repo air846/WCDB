@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "Windows 微信 4.x 聊天记录全量导出工具（HTML + JSON + 媒体）"
 requires-python = ">=3.10"
 dependencies = [
-    "sqlcipher3-binary>=0.5.3",
     "pycryptodome>=3.20",
     "jinja2>=3.1",
 ]
