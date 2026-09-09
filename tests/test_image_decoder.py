@@ -347,6 +347,7 @@ def test_render_session_image_ext_whitelist(tmp_path):
         msg(1, Media(kind="image", ext=".jpg", rel_path="media/image/a.jpg")),
         msg(2, Media(kind="image", ext=".dat", rel_path="media/image/b.dat")),
         msg(3, Media(kind="image", ext=".wxgf", rel_path="media/image/c.wxgf")),
+        msg(4, Media(kind="emoji", ext=".bin", rel_path="media/emoji/d.bin")),
     ]
     HtmlRenderer().render_session(tmp_path / "s", Session(id="s", name="S"),
                                   msgs, {"messages": 3})
@@ -356,3 +357,5 @@ def test_render_session_image_ext_whitelist(tmp_path):
     assert '<img src="media/image/c.wxgf"' not in html
     assert 'href="media/image/b.dat"' in html
     assert 'href="media/image/c.wxgf"' in html
+    assert 'href="media/emoji/d.bin"' in html
+    assert "[表情]" in html

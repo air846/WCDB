@@ -25,6 +25,8 @@
       <video src="{{ m.media.rel_path }}" controls preload="metadata"></video>
     {% elif m_ok and m.media.kind == "voice" %}
       <audio src="{{ m.media.rel_path }}" controls preload="metadata"></audio>
+    {% elif m_ok and m.media.kind == "emoji" %}
+      <a href="{{ m.media.rel_path }}" title="表情（微信自有加密，未解码）">[表情]</a>
     {% elif m_ok %}
       <a href="{{ m.media.rel_path }}">下载 {{ m.media.kind }} {{ m.media.ext }}</a>
     {% elif m.raw %}

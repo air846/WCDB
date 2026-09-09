@@ -84,6 +84,10 @@ def _plaintext_ok(pt: bytes) -> bool:
         if pt[3] in (0xE0, 0xE1):
             return pt[6:10] in (b"JFIF", b"Exif")
         return pt[3] in (0xDB, 0xEE, 0xC0, 0xC2, 0xC4)
+    if pt[:2] == b"BM":  # BMP 只有 2 字节 magic，需校验头部字段
+        size = int.from_bytes(pt[2:6], "little")
+        offset = int.from_bytes(pt[10:14], "little")
+        return 0 < size and 14 <= offset <= 1078
     return detect_format(pt) is not None
 
 
