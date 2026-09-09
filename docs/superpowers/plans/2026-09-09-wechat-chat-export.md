@@ -2364,7 +2364,7 @@ def test_main_resume_skips_done(tmp_path):
     (out / "wxid_b" / ".done").write_text("done")
     code = cli.main([
         "--data-dir", str(env / "data"), "--key-hex", KEY,
-        "--out", str(out), "--session", "wxid_b",
+        "--out", str(out), "--session", "wxid_b", "--resume",
     ])
     assert code == 0
     # 会话被跳过：.done 内容保持原样（未被重新写入）
