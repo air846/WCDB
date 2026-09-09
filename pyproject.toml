@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 wxgf = ["av>=12"]          # wxgf（微信 HEVC）图片转 JPEG，需 FFmpeg 库（wheel 自带）
+voice = ["rsilk>=0.1.4"]   # SILK 语音转 WAV（浏览器可直接播放）
 
 [project.scripts]
 wechat-export = "wechat_export.cli:main"

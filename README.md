@@ -22,7 +22,12 @@
   `.jpg/.png/.gif/.webp`，旧版单字节 XOR `.dat` 同样兼容；`wxgf`（HEVC 容器）在
   安装可选依赖 `av` 后自动转 JPEG；图片密钥优先从 `Weixin.exe` 进程内存自动提取
   （也可 `--image-key` 手动提供）
-- `--resume` 断点续导
+- **语音转码**：SILK 语音在安装可选依赖 `rsilk` 后自动转 24kHz WAV，HTML 内直接
+  播放并显示时长；未安装时保留 `.silk` 下载链接
+- **应用消息摘要**：`type=49` 的 appmsg XML 解析为可读卡片（引用/链接/文件/
+  转账/红包/聊天记录/小程序/视频号/拍一拍等），JSON 保留原始 XML 并额外给出
+  `appmsg` 结构化字段
+- `--resume` 断点续导（导出格式升级时自动重导旧会话）
 
 ## 安装
 
@@ -35,10 +40,11 @@ pip install -e ".[dev]"
 依赖：`pycryptodome`（AES）、`jinja2`（HTML 模板）、`zstandard`（解压压缩消息）、
 `pytest`（开发）。
 
-可选：`av`（wxgf/HEVC 图片转 JPEG；多数微信 4.x 整图是 wxgf，建议安装）：
+可选：`av`（wxgf/HEVC 图片转 JPEG；多数微信 4.x 整图是 wxgf，建议安装）、
+`rsilk`（SILK 语音转 WAV，浏览器可直接播放）：
 
 ```bash
-pip install -e ".[dev,wxgf]"
+pip install -e ".[dev,wxgf,voice]"
 ```
 
 ## 用法
@@ -131,8 +137,10 @@ wechat-export --out ./chat_export --keys-file keys.json
   转成 JPEG；未安装或少数 HEIC 变体转码失败时保留 `.wxgf` 下载链接
 - **自定义表情**：`business/emoticon/Persist` 使用微信自有加密（与图片密钥不同），
   暂未解码，以 `.bin` 原样归档
-- 视频/文件类媒体仅能归档已下载到本机的文件；未下载的标记 `missing`
-- 语音以 `.silk` 原样归档
+- 视频/文件类媒体仅能归档已下载到本机的文件（视频按 `msg/video` 下文件 id、
+  文件按 `msg/file` 下同名文件匹配）；未下载的标记 `missing`
+- 语音转 WAV 需要可选依赖 `rsilk`（PyPI 预编译轮子覆盖 Python 3.7–3.12；更高版本
+  可能需自行编译 Rust 扩展）；极少数损坏/非标准 SILK 会保留 `.silk` 供下载
 - 群成员显示名/头像等更丰富的联系人信息可后续增强
 
 ## 常见问题
@@ -142,6 +150,11 @@ wechat-export --out ./chat_export --keys-file keys.json
   一张图片，再 `wechat-export --out ./chat_export --resume`（会自动重导未解码会话），
   或 `--image-key` 手动提供；③ 若仍是 `.wxgf`，安装 `av` 后重跑
   （`pip install "wechat-export[wxgf]"`）
+- **语音播放不了**：安装可选依赖 `rsilk` 后重跑
+  （`pip install "wechat-export[voice]"`），`--resume` 会自动重导并转成 `.wav`；
+  若个别语音仍是 `.silk`，说明该条 SILK 已损坏/非标准，点击链接可下载原文件
+- **type=49 消息显示为可读卡片**：引用/链接/文件/转账/红包等直接展示摘要；
+  原始 XML 仍保存在 JSON 的 `content`，结构化字段在 `appmsg`
 - **找不到数据目录**：用 `--data-dir` 指定数据根（`...\xwechat_files`）
 - **密钥提取失败**：确认微信已登录并保持运行；或 `--key-hex` / `--keys-file` 手动提供
 - **图片密钥提取失败**：先在微信中打开一张聊天图片（点开大图）再重试，或加

@@ -19,20 +19,43 @@
     <div class="muted">{{ m.sender.name|e }}</div>
     {% set m_ok = m.media and m.media.status == "ok" %}
     {% set img_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp") %}
-    {% if m_ok and m.media.kind in ("image", "emoji") and m.media.ext in img_exts %}
+    {% if m.appmsg %}
+      {% set a = m.appmsg %}
+      <div class="appmsg">
+        <div class="muted">[{{ a.kind }}]{% if a.source %} {{ a.source|e }}{% endif %}</div>
+        {% if a.quote %}
+          <div class="quote muted prewrap">{% if a.quote.name %}{{ a.quote.name|e }}：{% endif %}{{ a.quote.content|e }}</div>
+          {% if a.title %}<div class="prewrap">{{ a.title|e }}</div>{% endif %}
+        {% else %}
+          {% if a.title %}
+            {% if a.safe_url %}<div><a href="{{ a.safe_url|e }}" target="_blank" rel="noopener noreferrer">{{ a.title|e }}</a></div>
+            {% else %}<div class="prewrap">{{ a.title|e }}</div>{% endif %}
+          {% endif %}
+          {% if a.desc and a.desc != a.title %}<div class="muted prewrap">{{ a.desc|e }}</div>{% endif %}
+          {% if a.safe_url and not a.title %}<div><a href="{{ a.safe_url|e }}" target="_blank" rel="noopener noreferrer">{{ a.safe_url|e }}</a></div>{% endif %}
+        {% endif %}
+        {% if a.kind == "文件" %}
+          {% if m_ok %}<div><a href="{{ m.media.rel_path }}">下载 {{ a.filename|e }}</a>{% if a.size %}（{{ a.size }} 字节）{% endif %}</div>
+          {% else %}<div class="muted">文件不在本机</div>{% endif %}
+        {% endif %}
+      </div>
+    {% elif m_ok and m.media.kind in ("image", "emoji") and m.media.ext in img_exts %}
       <img src="{{ m.media.rel_path }}" onclick="zoom(this)" loading="lazy" alt="图片">
     {% elif m_ok and m.media.kind == "video" %}
       <video src="{{ m.media.rel_path }}" controls preload="metadata"></video>
-    {% elif m_ok and m.media.kind == "voice" %}
+    {% elif m_ok and m.media.kind == "voice" and m.media.ext == ".wav" %}
       <audio src="{{ m.media.rel_path }}" controls preload="metadata"></audio>
+      {% if m.media.duration_ms %}<span class="muted"> {{ (m.media.duration_ms / 1000)|round(1) }}″</span>{% endif %}
+    {% elif m_ok and m.media.kind == "voice" %}
+      <a href="{{ m.media.rel_path }}">[语音{% if m.media.duration_ms %} {{ (m.media.duration_ms / 1000)|round(1) }}″{% endif %}（未转码，点击下载 .silk）]</a>
     {% elif m_ok and m.media.kind == "emoji" %}
       <a href="{{ m.media.rel_path }}" title="表情（微信自有加密，未解码）">[表情]</a>
     {% elif m_ok %}
       <a href="{{ m.media.rel_path }}">下载 {{ m.media.kind }} {{ m.media.ext }}</a>
-    {% elif m.raw %}
-      <div class="muted">[{{ m.type_name }}] {{ m.content }}</div>
+    {% elif m.raw and not m.display %}
+      <div class="muted prewrap">[{{ m.type_name }}] {{ m.content|e }}</div>
     {% else %}
-      <div>{{ m.content }}</div>
+      <div class="prewrap">{{ (m.display or m.content)|e }}</div>
     {% endif %}
   </div>
 </div>

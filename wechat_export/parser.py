@@ -8,7 +8,10 @@
 
 import re
 import xml.etree.ElementTree as ET
+from html import unescape
+from pathlib import Path
 
+from wechat_export.appmsg import parse_appmsg
 from wechat_export.message_model import Media, Message
 from wechat_export.schema import CT_ZSTD, SchemaInfo
 
@@ -74,6 +77,21 @@ def _find(root: ET.Element, *tags: str) -> ET.Element | None:
     return None
 
 
+def _app_element(root: ET.Element) -> ET.Element:
+    """返回 appmsg 元素；根即 appmsg 时返回根。"""
+    if root.tag == "appmsg":
+        return root
+    app = root.find("appmsg")
+    return app if app is not None else root
+
+
+def _int_attr(value) -> int:
+    try:
+        return int(str(value).strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def parse_media_from_content(content: str, base_type: int) -> Media | None:
     kind_ext = resolve_kind_and_ext(base_type)
     if not kind_ext or not content:
@@ -109,14 +127,27 @@ def parse_media_from_content(content: str, base_type: int) -> Media | None:
         md5 = el.get("md5", "")
         ext = ".mp4"
     elif kind == "file":
-        el = _find(root, ".//appattach", ".//appmsg/appattach")
-        if el is None:
+        app = _app_element(root)
+        app_type = _int_attr(app.findtext("type"))
+        attach = app.find("appattach")
+        filename = (app.findtext("title") or "").strip()
+        fileext = ""
+        if attach is not None:
+            fileext = (attach.get("fileext") or attach.findtext("fileext") or "").strip()
+            md5 = (attach.get("md5") or attach.findtext("md5") or "").strip()
+            size = _int_attr(attach.findtext("totallen"))
+        md5 = md5 or (app.findtext("md5") or "").strip()
+        # 仅 type=6（或旧库无 type 但带文件特征）视为文件；引用/链接等 appmsg
+        # 也可能带 <md5>（缩略图）或异常 <fileext>（如拍一拍）。
+        if app_type != 6 and not (app_type == 0 and (fileext or md5)):
             return None
-        md5 = el.get("md5", "") or (el.findtext("md5") or "")
-        ext = "." + ((el.get("fileext", "") or el.findtext("fileext") or "dat").lstrip("."))
-    if not md5 and kind != "voice":
+        ext = "." + fileext.lstrip(".") if fileext else (Path(filename).suffix or ".dat")
+        return Media(kind=kind, md5=md5, size=size, ext=ext, filename=filename)
+    if not md5 and kind not in ("voice", "video"):
         return None
-    return Media(kind=kind, md5=md5, size=size, ext=ext)
+    duration_ms = size if kind == "voice" else 0
+    return Media(kind=kind, md5=md5, size=size if kind != "voice" else 0,
+                 ext=ext, duration_ms=duration_ms)
 
 
 def media_file_id(packed_info) -> str:
@@ -124,6 +155,68 @@ def media_file_id(packed_info) -> str:
     if isinstance(packed_info, (bytes, bytearray)):
         m = re.search(rb"[0-9a-f]{32}", packed_info)
         return m.group(0).decode("ascii") if m else ""
+    return ""
+
+
+_IMG_TAG_RE = re.compile(r"<img[^>]*>")
+_WC_LINK_RE = re.compile(r"</?_wc_custom_link_[^>]*>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _strip_markup(text: str) -> str:
+    text = _IMG_TAG_RE.sub("", text)
+    text = _WC_LINK_RE.sub("", text)
+    return _WS_RE.sub(" ", unescape(text)).strip()
+
+
+def _sysmsg_display(content: str) -> str:
+    """系统消息（type=10000）：撤回/模板消息取纯文本，其余去标签。"""
+    root = _safe_xml(content)
+    if root is not None and root.tag == "sysmsg":
+        if root.get("type", "") == "revokemsg":
+            el = root.find(".//revokemsg/content")
+            if el is not None and (el.text or "").strip():
+                return el.text.strip()
+        plain = root.find(".//sysmsgtemplate//plain")
+        if plain is not None and (plain.text or "").strip():
+            return plain.text.strip()
+        content_el = root.find(".//content")
+        if content_el is not None and (content_el.text or "").strip():
+            return _strip_markup(content_el.text)
+        text = _WS_RE.sub(" ", " ".join(
+            t for t in root.itertext() if t and t.strip())).strip()
+        if text:
+            return text
+    return _strip_markup(content)
+
+
+def _special_display(base_type: int, content: str) -> str:
+    """非文本、非 appmsg 的常见结构化消息 → 纯文本占位/摘要。"""
+    if base_type == 3:
+        return "[图片]"
+    if base_type == 43:
+        return "[视频]"
+    if base_type == 47:
+        return "[表情]"
+    if base_type == 34:
+        root = _safe_xml(content)
+        el = root.find(".//voicemsg") if root is not None else None
+        ms = _int_attr(el.get("voicelength")) if el is not None else 0
+        return f"[语音 {ms / 1000:.1f}″]" if ms else "[语音]"
+    if base_type == 10000:
+        return _sysmsg_display(content)
+    if base_type == 48:
+        root = _safe_xml(content)
+        loc = root.find(".//location") if root is not None else None
+        if loc is not None:
+            label = loc.get("label") or loc.get("poiname") or ""
+            return f"[位置] {label}".strip()
+        return "[位置]"
+    if base_type == 50:
+        root = _safe_xml(content)
+        el = root.find(".//msg") if root is not None else None
+        text = (el.text or "").strip() if el is not None else ""
+        return f"[通话] {text}" if text else "[通话]"
     return ""
 
 
@@ -139,6 +232,8 @@ def parse_message_row(row: dict, schema: SchemaInfo, self_wxid: str, session_id:
     is_self = sender_wxid == self_wxid
     content = to_text(decompress(row.get(schema.content),
                                  int(row.get(schema.content_ct, 0) or 0)))
+    appmsg = parse_appmsg(content) if base_type == 49 else None
+    display = appmsg.text() if appmsg else _special_display(base_type, content)
     media = parse_media_from_content(content, base_type)
     if media is not None:
         file_id = media_file_id(row.get("packed_info_data"))
@@ -156,5 +251,5 @@ def parse_message_row(row: dict, schema: SchemaInfo, self_wxid: str, session_id:
         sender={"wxid": sender_wxid,
                 "name": info.get("name") or sender_wxid,
                 "is_self": is_self},
-        content=content, media=media, raw=raw,
+        content=content, media=media, raw=raw, appmsg=appmsg, display=display,
     )

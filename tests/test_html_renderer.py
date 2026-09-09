@@ -30,12 +30,76 @@ def test_render_index_and_session(tmp_path):
     out = tmp_path / "wxid_b"
     msgs = [
         _msg(1, 1700000000000, 3, "图片", Media(kind="image", rel_path="media/image/a.jpg")),
-        _msg(2, 1700001000000, 34, "语音", Media(kind="voice", rel_path="media/voice/a.amr")),
+        _msg(2, 1700001000000, 34, "语音",
+             Media(kind="voice", rel_path="media/voice/a.wav", ext=".wav")),
     ]
     renderer.render_session(out, sessions[0], msgs, {"messages": 2})
     html = (out / "index.html").read_text(encoding="utf-8")
     assert "media/image/a.jpg" in html
     assert '<audio' in html
+
+
+def test_render_appmsg_quote_without_raw_xml(tmp_path):
+    from wechat_export.appmsg import parse_appmsg
+
+    content = ('<msg><appmsg><title>示例标题</title><type>57</type>'
+               '<refermsg><type>1</type><displayname>示例昵称</displayname>'
+               '<content>示例引用内容</content></refermsg></appmsg></msg>')
+    m = _msg(1, 1700000000000, 49, content)
+    m.appmsg = parse_appmsg(content)
+    m.display = m.appmsg.text()
+    out = tmp_path / "s"
+    HtmlRenderer().render_session(out, Session(id="s", name="S"), [m],
+                                  {"messages": 1})
+    html = (out / "index.html").read_text(encoding="utf-8")
+    assert "示例引用内容" in html
+    assert "示例标题" in html
+    assert "<msg" not in html and "&lt;msg" not in html
+    assert "[应用/文件]" not in html
+
+
+def test_render_appmsg_link(tmp_path):
+    from wechat_export.appmsg import parse_appmsg
+
+    content = ('<msg><appmsg><title>看电影</title><des>一起来看电影</des>'
+               '<type>5</type><url>http://example.com/film</url></appmsg></msg>')
+    m = _msg(1, 1700000000000, 49, content)
+    m.appmsg = parse_appmsg(content)
+    out = tmp_path / "s"
+    HtmlRenderer().render_session(out, Session(id="s", name="S"), [m],
+                                  {"messages": 1})
+    html = (out / "index.html").read_text(encoding="utf-8")
+    assert 'href="http://example.com/film"' in html
+    assert "看电影" in html
+
+
+def test_render_voice_wav_audio_and_silk_fallback(tmp_path):
+    out = tmp_path / "s"
+    msgs = [
+        _msg(1, 1700000000000, 34, "语音",
+             Media(kind="voice", rel_path="media/voice/a.wav", ext=".wav",
+                   duration_ms=2300)),
+        _msg(2, 1700001000000, 34, "语音",
+             Media(kind="voice", rel_path="media/voice/b.silk", ext=".silk",
+                   duration_ms=1800)),
+    ]
+    HtmlRenderer().render_session(out, Session(id="s", name="S"), msgs,
+                                  {"messages": 2})
+    html = (out / "index.html").read_text(encoding="utf-8")
+    assert '<audio src="media/voice/a.wav"' in html
+    assert 'href="media/voice/b.silk"' in html
+    assert "<audio src=\"media/voice/b.silk\"" not in html
+
+
+def test_render_missing_emoji_placeholder(tmp_path):
+    out = tmp_path / "s"
+    m = _msg(1, 1700000000000, 47, '<msg><emoji md5="x"/></msg>')
+    m.display = "[表情]"
+    HtmlRenderer().render_session(out, Session(id="s", name="S"), [m],
+                                  {"messages": 1})
+    html = (out / "index.html").read_text(encoding="utf-8")
+    assert "[表情]" in html
+    assert "&lt;emoji" not in html and "<emoji" not in html
 
 
 def test_render_session_escapes_user_content(tmp_path):

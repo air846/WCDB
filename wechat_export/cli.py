@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from wechat_export import db_access, locator
+from wechat_export import EXPORT_FORMAT_VERSION, db_access, locator
 from wechat_export.exceptions import (
     ConfigError, ExportError, PartialExportError, WeChatNotFoundError, format_error,
 )
@@ -25,9 +25,16 @@ from wechat_export.key_provider import KeyProvider, parse_key_hex
 from wechat_export.message_model import Media, Message, Session
 from wechat_export.parser import parse_message_row
 from wechat_export.schema import is_session_table, load_schema
+from wechat_export.voice_decoder import VOICE_AVAILABLE, decode_silk
 
 SESSION_SAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 SESSION_DB_RE = re.compile(r"^message_\d+\.db$")
+DUP_SUFFIX_RE = re.compile(r"\(\d+\)(?=\.[^.]*$)")
+
+
+def _strip_dup_suffix(name: str) -> str:
+    """去掉下载副本后缀：`报告(1).pdf` → `报告.pdf`。"""
+    return DUP_SUFFIX_RE.sub("", name)
 
 
 def _safe_session_dir(name: str) -> str:
@@ -60,9 +67,11 @@ class ExportReport:
     media_missing: int = 0
     skipped: int = 0
     media_decoded: int = 0
+    voice_decoded: int = 0
     errors: list[str] = field(default_factory=list)
     image_key_note: str = ""
     wxgf_note: str = ""
+    voice_note: str = ""
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -243,7 +252,43 @@ class MediaResolver:
         self.xor_key = xor_key
         self.decoded = 0
         self.wxgf_pending = 0
+        self.voice_decoded = 0
+        self.voice_pending = 0
+        self.voice_failed = 0
         self._index: dict[str, Path] | None = None
+        self._file_index: dict[str, Path] | None = None
+        self._video_index: dict[str, Path] | None = None
+
+    def _videos(self) -> dict[str, Path]:
+        """按文件 id 索引 msg/video 下的 mp4。"""
+        if self._video_index is None:
+            base = self.account_root / "msg" / "video"
+            index: dict[str, Path] = {}
+            if base.is_dir():
+                for p in base.rglob("*.mp4"):
+                    if p.is_file():
+                        index.setdefault(p.stem, p)
+            self._video_index = index
+        return self._video_index
+
+    def _files(self) -> dict[str, Path]:
+        """按文件名索引 msg/file 下的本机文件（忽略 (1)/(2) 副本后缀）。"""
+        if self._file_index is None:
+            base = self.account_root / "msg" / "file"
+            index: dict[str, Path] = {}
+            if base.is_dir():
+                for p in base.rglob("*"):
+                    if p.is_file():
+                        index.setdefault(p.name, p)
+                        index.setdefault(_strip_dup_suffix(p.name), p)
+            self._file_index = index
+        return self._file_index
+
+    def _find_file(self, filename: str) -> Path | None:
+        if not filename:
+            return None
+        index = self._files()
+        return index.get(filename) or index.get(_strip_dup_suffix(filename))
 
     def _session_index(self, username: str) -> dict[str, Path]:
         """按 md5 前缀索引该会话的媒体文件（大文件优先），避免逐消息 rglob。"""
@@ -288,13 +333,37 @@ class MediaResolver:
     def resolve(self, media: Media, username: str, local_id: int) -> Media:
         if media.status != "ok":
             return media
+        if media.kind == "file":
+            src = self._find_file(media.filename)
+            if src is None:
+                return placeholder_media(media)
+            return self.archive.save_file(src, "file", src.suffix or media.ext or ".dat")
+        if media.kind == "video":
+            if not media.md5:
+                return placeholder_media(media)
+            src = (self._videos().get(media.md5)
+                   or self._session_index(username).get(media.md5))
+            if src is None:
+                return placeholder_media(media)
+            return self.archive.save_file(src, "video", src.suffix or ".mp4")
         if media.kind == "voice":
             chat_id = self.username_to_name2id.get(username)
             blob = self.voice_index.get((chat_id, local_id)) if chat_id else None
-            if blob:
-                return self.archive.save_bytes(
-                    blob, "voice", ".silk", md5=media.md5 or f"voice_{chat_id}_{local_id}")
-            return placeholder_media(media)
+            if not blob:
+                return placeholder_media(media)
+            wav = decode_silk(blob)
+            if wav is not None:
+                self.voice_decoded += 1
+                result = self.archive.save_bytes(wav, "voice", ".wav")
+                result.duration_ms = media.duration_ms
+                return result
+            if VOICE_AVAILABLE:
+                self.voice_failed += 1
+            else:
+                self.voice_pending += 1
+            result = self.archive.save_bytes(blob, "voice", ".silk")
+            result.duration_ms = media.duration_ms
+            return result
         if media.kind == "emoji":
             base = self.account_root / "business" / "emoticon"
             persist = base / "Persist" / media.md5[:2] / media.md5
@@ -341,7 +410,7 @@ def _make_session(username: str, contacts: dict[str, str]) -> Session:
 
 
 def _needs_reexport(out_dir: Path, image_key: bytes | None) -> bool:
-    """上次导出没有图片密钥/未装 av，而本次具备条件 → 值得重导。"""
+    """上次导出缺少本次才具备的条件（格式版本/图片密钥/解码器）→ 值得重导。"""
     from wechat_export.image_decoder import WXGF_AVAILABLE
 
     if not image_key:
@@ -351,9 +420,13 @@ def _needs_reexport(out_dir: Path, image_key: bytes | None) -> bool:
             (out_dir / "session.json").read_text(encoding="utf-8")).get("stats", {})
     except Exception:  # noqa: BLE001
         return False
+    if stats.get("format_version", 0) < EXPORT_FORMAT_VERSION:
+        return True
     if not stats.get("image_key"):
         return True
     if WXGF_AVAILABLE and not stats.get("wxgf_available"):
+        return True
+    if VOICE_AVAILABLE and not stats.get("voice_available"):
         return True
     return False
 
@@ -497,6 +570,15 @@ def run_export(args: argparse.Namespace) -> ExportReport:
                 ok, miss = _archive_media(msgs, resolver, username)
                 archive.prune()
                 report.media_decoded += resolver.decoded
+                report.voice_decoded += resolver.voice_decoded
+                if resolver.voice_pending and not report.voice_note:
+                    report.voice_note = (
+                        f"有 {resolver.voice_pending} 条语音未转码（.silk 原样归档）："
+                        '安装可选依赖后重跑即可在线播放：pip install "wechat-export[voice]"')
+                elif resolver.voice_failed and not report.voice_note:
+                    report.voice_note = (
+                        f"有 {resolver.voice_failed} 条语音无法解码（可能已损坏或非标准 SILK），"
+                        "已保留 .silk 供下载")
                 if resolver.wxgf_pending and not report.wxgf_note:
                     report.wxgf_note = (
                         f"有 {resolver.wxgf_pending} 张 wxgf（微信 HEVC）图片未能转码："
@@ -507,8 +589,11 @@ def run_export(args: argparse.Namespace) -> ExportReport:
                                {"messages": len(msgs), "media_ok": ok,
                                 "media_missing": miss,
                                 "media_decoded": resolver.decoded if not args.no_media else 0,
+                                "voice_decoded": resolver.voice_decoded if not args.no_media else 0,
                                 "image_key": bool(image_key),
-                                "wxgf_available": WXGF_AVAILABLE})
+                                "wxgf_available": WXGF_AVAILABLE,
+                                "voice_available": VOICE_AVAILABLE,
+                                "format_version": EXPORT_FORMAT_VERSION})
             renderer.render_session(out_dir, session, msgs, {"messages": len(msgs)})
             report.sessions_done += 1
             report.messages += len(msgs)
@@ -525,7 +610,8 @@ def run_export(args: argparse.Namespace) -> ExportReport:
         "stats": {"sessions": report.sessions_done,
                   "messages": report.messages,
                   "media": {"ok": report.media_ok, "missing": report.media_missing,
-                            "decoded": report.media_decoded},
+                            "decoded": report.media_decoded,
+                            "voice_decoded": report.voice_decoded},
                   "skipped": report.skipped},
     })
     write_sessions_index(out_root, done_sessions, counts)
@@ -551,6 +637,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"提示：{report.image_key_note}", file=sys.stderr)
         if report.wxgf_note:
             print(f"提示：{report.wxgf_note}", file=sys.stderr)
+        if report.voice_note:
+            print(f"提示：{report.voice_note}", file=sys.stderr)
         print(f"输出目录：{Path(args.out).resolve()}")
         return 0
     except ExportError as e:

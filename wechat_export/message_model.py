@@ -34,10 +34,14 @@ class Media:
     ext: str = ""
     rel_path: str = ""
     status: str = "ok"  # ok | missing
+    filename: str = ""
+    duration_ms: int = 0
 
     def to_dict(self) -> dict:
         return {"kind": self.kind, "md5": self.md5, "size": self.size,
-                "ext": self.ext, "rel_path": self.rel_path, "status": self.status}
+                "ext": self.ext, "rel_path": self.rel_path,
+                "status": self.status, "filename": self.filename,
+                "duration_ms": self.duration_ms}
 
 
 @dataclass
@@ -51,6 +55,8 @@ class Message:
     content: str
     media: Optional[Media] = None
     raw: Optional[dict] = field(default=None)
+    appmsg: Optional[object] = None  # appmsg.AppMsg（type 49）
+    display: str = ""  # 人类可读展示文本（非纯文本消息）
 
     def to_dict(self) -> dict:
         return {
@@ -59,4 +65,6 @@ class Message:
             "sender": self.sender, "content": self.content,
             "media": self.media.to_dict() if self.media else None,
             "raw": self.raw,
+            "appmsg": self.appmsg.to_dict() if self.appmsg else None,
+            "display": self.display or self.content,
         }

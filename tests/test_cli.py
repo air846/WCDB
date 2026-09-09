@@ -6,6 +6,7 @@ import pytest
 from tests.fixtures import db_factory as f
 from wechat_export import cli
 from wechat_export.exceptions import KeyExtractError
+from wechat_export.message_model import Media
 
 KEY = "a1" * 32
 
@@ -96,10 +97,88 @@ def test_needs_reexport(tmp_path):
     assert cli._needs_reexport(out, b"k" * 16) is True   # 上次无密钥
     (out / "session.json").write_text(json.dumps({
         "id": "s", "name": "S",
-        "stats": {"messages": 1, "image_key": True, "wxgf_available": True},
+        "stats": {"messages": 1, "format_version": cli.EXPORT_FORMAT_VERSION,
+                  "image_key": True, "wxgf_available": cli.WXGF_AVAILABLE,
+                  "voice_available": cli.VOICE_AVAILABLE},
     }), encoding="utf-8")
     assert cli._needs_reexport(out, b"k" * 16) is False
     assert cli._needs_reexport(out, None) is False       # 本次也没有密钥
+
+
+def test_needs_reexport_old_format_version(tmp_path):
+    out = tmp_path / "s"
+    out.mkdir()
+    (out / "session.json").write_text(json.dumps({
+        "id": "s", "name": "S",
+        "stats": {"messages": 1, "format_version": 0, "image_key": True,
+                  "wxgf_available": True, "voice_available": True},
+    }), encoding="utf-8")
+    assert cli._needs_reexport(out, b"k" * 16) is True
+
+
+def test_resolve_file_from_msg_file(tmp_path):
+    account = tmp_path / "acct"
+    target = account / "msg" / "file" / "2024-05" / "报告.pdf"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"pdf-bytes")
+    arc = cli.MediaArchive(tmp_path / "out" / "media")
+    resolver = cli.MediaResolver(account, arc, {}, {})
+    media = Media(kind="file", ext=".pdf", filename="报告.pdf")
+    out = resolver.resolve(media, "wxid_b", 1)
+    assert out.status == "ok"
+    assert out.rel_path.endswith(".pdf")
+    assert (tmp_path / "out" / out.rel_path).read_bytes() == b"pdf-bytes"
+
+
+def test_resolve_video_from_msg_video(tmp_path):
+    account = tmp_path / "acct"
+    target = account / "msg" / "video" / "2024-05" / "abc123.mp4"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"mp4-bytes")
+    arc = cli.MediaArchive(tmp_path / "out" / "media")
+    resolver = cli.MediaResolver(account, arc, {}, {})
+    media = Media(kind="video", md5="abc123", ext=".mp4")
+    out = resolver.resolve(media, "wxid_b", 1)
+    assert out.status == "ok"
+    assert out.rel_path.endswith(".mp4")
+    assert (tmp_path / "out" / out.rel_path).read_bytes() == b"mp4-bytes"
+
+
+def test_resolve_missing_file_is_placeholder(tmp_path):
+    arc = cli.MediaArchive(tmp_path / "media")
+    resolver = cli.MediaResolver(tmp_path / "acct", arc, {}, {})
+    media = Media(kind="file", ext=".pdf", filename="nope.pdf")
+    assert resolver.resolve(media, "wxid_b", 1).status == "missing"
+
+
+def test_resolve_voice_converts_to_wav(tmp_path):
+    pytest.importorskip("rsilk")
+    from tests.fixtures.silk_factory import silk_bytes
+
+    arc = cli.MediaArchive(tmp_path / "media")
+    resolver = cli.MediaResolver(tmp_path / "acct", arc,
+                                 {(1, 5): silk_bytes()}, {"wxid_b": 1})
+    out = resolver.resolve(Media(kind="voice", ext=".silk", duration_ms=500),
+                           "wxid_b", 5)
+    assert out.status == "ok"
+    assert out.ext == ".wav"
+    assert out.duration_ms == 500
+    assert resolver.voice_decoded == 1
+    assert (tmp_path / out.rel_path).read_bytes()[:4] == b"RIFF"
+
+
+def test_resolve_voice_fallback_when_no_decoder(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "decode_silk", lambda data: None)
+    monkeypatch.setattr(cli, "VOICE_AVAILABLE", False)
+    arc = cli.MediaArchive(tmp_path / "media")
+    resolver = cli.MediaResolver(tmp_path / "acct", arc,
+                                 {(1, 5): b"silk-bytes"}, {"wxid_b": 1})
+    out = resolver.resolve(Media(kind="voice", ext=".silk", duration_ms=1200),
+                           "wxid_b", 5)
+    assert out.status == "ok"
+    assert out.ext == ".silk"
+    assert out.duration_ms == 1200
+    assert resolver.voice_pending == 1
 
 
 def test_resume_reprocesses_when_image_key_available(tmp_path):
