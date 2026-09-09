@@ -453,12 +453,14 @@ git commit -m "feat: 统一消息模型"
 
 **Interfaces:**
 - Consumes: 无（仅依赖 pycryptodome）
-- Produces（解密路径已按 SQLCipher 官方源码 src/sqlcipher.c 核实）：
+- Produces（布局已按 SQLCipher 官方源码 src/sqlcipher.c 核实，`sqlite3Codec` 节）：
   - `SQLITE_MAGIC = b"SQLite format 3\x00"`、`IV_SIZE = 16`、`KEY_SIZE = 32`
-  - `class SqlcipherError(Exception)`
-  - `def parse_header(data: bytes) -> tuple[int, int]`：返回 (page_size, reserved)；页大小=偏移16 大端 uint16（值 1 表示 65536），保留区=偏移 20 字节；魔数不符/无保留区/`(page_size-reserved) % 16 != 0` 抛 `SqlcipherError`
-  - `def decrypt_db(data: bytes, key_hex: str) -> bytes`：逐页 AES-256-CBC（密钥=raw 32 字节，IV=该页保留区前 16 字节）解密，拼出明文 SQLite（头部字节 20 清零）；明文大小须为页大小整数倍；密钥非 32 字节抛 `SqlcipherError`
-  - `def encrypt_db(plain: bytes, key_hex: str, page_size: int = 4096, reserved: int = 48) -> bytes`：明文 SQLite → SQLCipher 加密文件（测试夹具生成用；每页写入随机 IV + 随机填充保留区，供 decrypt_db 读取）
+  - `PAGE_SIZE_CANDIDATES = [4096, 1024, 2048, 8192, 512, 65536]`、`RESERVED_CANDIDATES = [48, 16]`（页 1 布局：文件[0:16]=随机 salt 明文；页 1 加密区=[16, P-R)；其他页=[0, P-R)；保留区=IV 16B + HMAC 取整到 16 倍数，即 48/16）
+  - `def is_plaintext_sqlite(data: bytes) -> bool`：`data[:16] == SQLITE_MAGIC and data[20] == 0`
+  - `def decrypt_db(data: bytes, key_hex: str, page_size: int, reserved: int) -> bytes`：逐页 AES-256-CBC 解密；页 1 输出 = `SQLITE_MAGIC` 注入 + 解密区（SQLCipher 在解密时用常量替换 salt 区）；输出头部字节 20 清零
+  - `def encrypt_db(plain: bytes, key_hex: str, page_size: int = 4096, reserved: int = 48) -> bytes`：逆操作（夹具生成用；页 1 写入随机 salt，加密 [16, P-R)）
+  - `def page1_header_ok(plain_page1: bytes, page_size: int) -> bool`：解密后页 1 头部特征校验（见下），用于布局枚举与错误密钥检测
+  - `def find_layout(data: bytes, key_hex: str) -> tuple[int, int] | None`：按 `(PAGE_SIZE_CANDIDATES × RESERVED_CANDIDATES)` 顺序（4096×48 优先）尝试解密页 1 并做 `page1_header_ok`，返回首个通过的 (page_size, reserved)；全失败返回 None
 
 - [ ] **Step 1: 写失败测试**
 
@@ -484,29 +486,43 @@ def _make_plain_sqlite(tmp_path) -> bytes:
     return p.read_bytes()
 
 
-def test_roundtrip(tmp_path):
+def _decrypt_and_open(db_bytes: bytes) -> sqlite3.Connection:
+    page_size, reserved = sc.find_layout(db_bytes, KEY)
+    assert page_size is not None
+    plain = sc.decrypt_db(db_bytes, KEY, page_size, reserved)
+    conn = sqlite3.connect(":memory:")
+    conn.deserialize(plain)
+    return conn
+
+
+def test_roundtrip_default_layout(tmp_path):
     plain = _make_plain_sqlite(tmp_path)
     enc = sc.encrypt_db(plain, KEY)
-    dec = sc.decrypt_db(enc, KEY)
-    assert dec[:16] == sc.SQLITE_MAGIC
-    assert dec[20] == 0  # 保留区字节已清零
-    conn = sqlite3.connect(":memory:")
-    conn.deserialize(dec)
+    assert not sc.is_plaintext_sqlite(enc)
+    conn = _decrypt_and_open(enc)
     assert conn.execute("SELECT a FROM t").fetchall() == [("你好",)]
     conn.close()
 
 
-def test_wrong_key_yields_garbage(tmp_path):
+def test_roundtrip_nondefault_layout(tmp_path):
+    plain = _make_plain_sqlite(tmp_path)
+    enc = sc.encrypt_db(plain, KEY, page_size=1024, reserved=16)
+    page_size, reserved = sc.find_layout(enc, KEY)
+    assert (page_size, reserved) == (1024, 16)
+    plain2 = sc.decrypt_db(enc, KEY, page_size, reserved)
+    assert plain2[:16] == sc.SQLITE_MAGIC
+
+
+def test_wrong_key_layout_not_found(tmp_path):
     plain = _make_plain_sqlite(tmp_path)
     enc = sc.encrypt_db(plain, KEY)
-    dec = sc.decrypt_db(enc, "cd" * 32)
-    assert dec[:16] != sc.SQLITE_MAGIC
+    assert sc.find_layout(enc, "cd" * 32) is None
 
 
-def test_parse_header_rejects_plain_sqlite(tmp_path):
+def test_plain_sqlite_detected(tmp_path):
     plain = _make_plain_sqlite(tmp_path)
-    with pytest.raises(sc.SqlcipherError):
-        sc.parse_header(plain)
+    assert sc.is_plaintext_sqlite(plain)
+    assert sc.find_layout(plain, KEY) is None  # 无保留区，无合法布局
 
 
 def test_bad_key_length_raises(tmp_path):
@@ -525,13 +541,17 @@ Expected: FAIL，ImportError: cannot import name 'sqlcipher'
 ```python
 """纯 Python SQLCipher 页加解密（pycryptodome）。
 
-解密路径依据 SQLCipher 官方源码（src/sqlcipher.c）核实：
-- 原始 32 字节密钥（PRAGMA key = "x'...'"）直接作为 AES-256 密钥，不经 PBKDF2
-- 文件头前 16 字节为明文魔数（raw key 模式不需要 KDF salt）
-- 页大小 = 头部偏移 16 大端 uint16（1=65536）；保留区大小 = 偏移 20 字节
-- 每页前 (页大小-保留区) 字节用 AES-256-CBC(密钥, 该页 IV) 加密；
-  IV = 该页保留区前 16 字节（明文存储），HMAC 仅用于完整性，读取时忽略
-- 解密输出为明文 SQLite：头部保留区字节清零，防 sqlite 按旧偏移读页
+布局依据 SQLCipher 官方源码（src/sqlcipher.c 的 sqlite3Codec）核实：
+- 原始 32 字节密钥（PRAGMA key = "x'...'")直接作为 AES-256 密钥，不经 PBKDF2
+- 页 1：文件[0:16]为明文随机 salt；加密区为 [16, 页大小-保留区)；
+  解密时首 16 字节由常量 SQLite 魔数替换（源码：memcpy(ctx->buffer, SQLITE_FILE_HEADER, 16)）
+- 其他页：加密区为 [0, 页大小-保留区)
+- 每页 IV = 该页保留区前 16 字节（明文存储）；HMAC 仅完整性，读取时忽略
+- 页大小/保留区在文件头不可读（源码注释："the first page of the database is
+  encrypted and thus sqlite can't effectively determine the pagesize"），
+  因此用候选布局枚举 + 页 1 头部特征校验探测（find_layout）
+- 错误密钥检测依赖解密后页 1 头部的确定性特征模式（页大小字段、版本字节、
+  保留区=0、fraction 常量 0x40/0x20/0x20），而非被注入的魔数
 """
 
 import os
@@ -540,24 +560,18 @@ from Crypto.Cipher import AES
 SQLITE_MAGIC = b"SQLite format 3\x00"
 IV_SIZE = 16
 KEY_SIZE = 32
+HEADER_SIZE = 16  # 页 1 明文 salt / 注入魔数区大小
+
+PAGE_SIZE_CANDIDATES = [4096, 1024, 2048, 8192, 512, 65536]
+RESERVED_CANDIDATES = [48, 16]  # 16(IV)+32(HMAC-SHA512) 或 16+20>36→48 取整；无 HMAC=16
 
 
 class SqlcipherError(Exception):
     pass
 
 
-def parse_header(data: bytes) -> tuple[int, int]:
-    if len(data) < 32 or data[:16] != SQLITE_MAGIC:
-        raise SqlcipherError("不是有效的 SQLCipher/SQLite 文件头")
-    page_size = int.from_bytes(data[16:18], "big")
-    if page_size == 1:
-        page_size = 65536
-    reserved = data[20]
-    if reserved == 0 or reserved < IV_SIZE:
-        raise SqlcipherError("文件头显示无保留区（疑似明文 SQLite，或非 SQLCipher）")
-    if (page_size - reserved) % 16 != 0:
-        raise SqlcipherError("页大小与保留区不匹配（疑似非 SQLCipher 布局）")
-    return page_size, reserved
+def is_plaintext_sqlite(data: bytes) -> bool:
+    return len(data) >= 32 and data[:16] == SQLITE_MAGIC and data[20] == 0
 
 
 def _parse_key(key_hex: str) -> bytes:
@@ -567,17 +581,29 @@ def _parse_key(key_hex: str) -> bytes:
     return raw
 
 
-def decrypt_db(data: bytes, key_hex: str) -> bytes:
-    page_size, reserved = parse_header(data)
+def _decrypt_region(ct: bytes, key: bytes, iv: bytes) -> bytes:
+    if len(ct) % 16 != 0:
+        raise SqlcipherError("加密区长度不是 16 的倍数")
+    return AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
+
+
+def decrypt_db(data: bytes, key_hex: str, page_size: int, reserved: int) -> bytes:
     key = _parse_key(key_hex)
     if len(data) % page_size != 0:
         raise SqlcipherError("文件大小不是页大小的整数倍")
+    if reserved < IV_SIZE or (page_size - reserved) % 16 != 0:
+        raise SqlcipherError("非法布局参数")
     out = bytearray()
     for off in range(0, len(data), page_size):
         page = data[off:off + page_size]
         iv = page[page_size - reserved:page_size - reserved + IV_SIZE]
-        ct = page[:page_size - reserved]
-        out += AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
+        if off == 0:
+            ct = page[HEADER_SIZE:page_size - reserved]
+            out += SQLITE_MAGIC
+            out += _decrypt_region(ct, key, iv)
+        else:
+            ct = page[:page_size - reserved]
+            out += _decrypt_region(ct, key, iv)
     out[20] = 0  # 明文库保留区字节清零
     return bytes(out)
 
@@ -588,17 +614,56 @@ def encrypt_db(plain: bytes, key_hex: str, page_size: int = 4096,
     key = _parse_key(key_hex)
     if len(plain) % page_size != 0:
         raise SqlcipherError("明文大小不是页大小的整数倍")
+    if reserved < IV_SIZE or (page_size - reserved) % 16 != 0:
+        raise SqlcipherError("非法布局参数")
     out = bytearray()
     for off in range(0, len(plain), page_size):
-        page = bytearray(plain[off:off + page_size])
-        page[16:18] = page_size.to_bytes(2, "big")
-        if off == 0:
-            page[20] = reserved
+        page = plain[off:off + page_size]
         iv = os.urandom(IV_SIZE)
-        ct = AES.new(key, AES.MODE_CBC, iv).encrypt(bytes(page[:page_size - reserved]))
-        out += ct
+        if off == 0:
+            salt = os.urandom(HEADER_SIZE)
+            ct = AES.new(key, AES.MODE_CBC, iv).encrypt(page[HEADER_SIZE:page_size - reserved])
+            out += salt + ct
+        else:
+            ct = AES.new(key, AES.MODE_CBC, iv).encrypt(page[:page_size - reserved])
+            out += ct
         out += iv + os.urandom(reserved - IV_SIZE)
     return bytes(out)
+
+
+def page1_header_ok(plain_page1: bytes, page_size: int) -> bool:
+    """解密后页 1 头部特征：页大小字段/版本字节/保留区 0/fraction 常量。"""
+    if len(plain_page1) < 32:
+        return False
+    ps_field = 1 if page_size == 65536 else page_size
+    if plain_page1[16:18] != ps_field.to_bytes(2, "big"):
+        return False
+    if plain_page1[18] not in (1, 2) or plain_page1[19] not in (1, 2):
+        return False
+    if plain_page1[20] != 0:
+        return False
+    return plain_page1[21] == 0x40 and plain_page1[22] == 0x20 and plain_page1[23] == 0x20
+
+
+def find_layout(data: bytes, key_hex: str) -> tuple[int, int] | None:
+    """按候选顺序探测 (page_size, reserved)；4096×48（SQLCipher 4 默认）优先。"""
+    key = _parse_key(key_hex)
+    for page_size in PAGE_SIZE_CANDIDATES:
+        if len(data) % page_size != 0:
+            continue
+        for reserved in RESERVED_CANDIDATES:
+            if page_size - reserved <= HEADER_SIZE:
+                continue
+            page = data[:page_size]
+            iv = page[page_size - reserved:page_size - reserved + IV_SIZE]
+            try:
+                plain = SQLITE_MAGIC + _decrypt_region(
+                    page[HEADER_SIZE:page_size - reserved], key, iv)
+            except SqlcipherError:
+                continue
+            if page1_header_ok(plain, page_size):
+                return page_size, reserved
+    return None
 ```
 
 - [ ] **Step 4: 运行确认通过**
@@ -626,8 +691,8 @@ git commit -m "feat: 纯 Python SQLCipher 页加解密"
 - Consumes: `wechat_export.sqlcipher`（Task 4）、`exceptions.DecryptError`
 - Produces：
   - factory：`create_encrypted_db(path: Path, key_hex: str, page_size=4096, reserved=48) -> None`（stdlib sqlite3 建明文含 message 表 → encrypt_db → 覆盖写入）；`insert_message(db_path: Path, *, key_hex: str, msg_id: int, ts: int, type_: int, content: str, is_sender: int, talker: str, subtype: int = 0, status: int = 0) -> None`（解密→插入→再加密）；`make_message_schema() -> dict` 同旧定义
-  - `def is_encrypted_db(db_path: Path) -> bool`
-  - `class EncryptedDb(db_path: Path, key_hex: str)`：解密到内存并 `sqlite3.deserialize`，**不写盘**；属性 `params: str`（`page_size=..;reserved=..`）；方法 `tables() / columns(table) / query(sql, args=()) -> list[dict] / close()`；头部非法/解密失败/魔数校验失败抛 `DecryptError`
+  - `def is_encrypted_db(db_path: Path) -> bool`（非明文 SQLite 即视为加密库）
+  - `class EncryptedDb(db_path: Path, key_hex: str)`：`find_layout` 定位布局→解密到内存→`sqlite3.deserialize`，**不写盘**；布局探测失败抛 `DecryptError`（密钥可能错误）；属性 `params: str`（`page_size=..;reserved=..`）；方法 `tables() / columns(table) / query(sql, args=()) -> list[dict] / close()`
   - `def open_encrypted(db_path: Path, key_hex: str) -> EncryptedDb`
 
 - [ ] **Step 1: 写失败测试**
@@ -679,7 +744,8 @@ def create_encrypted_db(path: Path, key_hex: str = KEY,
 def insert_message(db_path: Path, *, key_hex: str = KEY, msg_id: int, ts: int,
                    type_: int, content: str, is_sender: int, talker: str,
                    subtype: int = 0, status: int = 0) -> None:
-    plain = sc.decrypt_db(db_path.read_bytes(), key_hex)
+    page_size, reserved = sc.find_layout(db_path.read_bytes(), key_hex)
+    plain = sc.decrypt_db(db_path.read_bytes(), key_hex, page_size, reserved)
     tmp = db_path.with_name(db_path.name + ".plain")
     tmp.write_bytes(plain)
     conn = sqlite3.connect(str(tmp))
@@ -690,7 +756,7 @@ def insert_message(db_path: Path, *, key_hex: str = KEY, msg_id: int, ts: int,
     )
     conn.commit()
     conn.close()
-    enc = sc.encrypt_db(tmp.read_bytes(), key_hex)
+    enc = sc.encrypt_db(tmp.read_bytes(), key_hex, page_size, reserved)
     tmp.unlink()
     db_path.write_bytes(enc)
 ```
@@ -730,7 +796,7 @@ def test_open_and_query(encrypted_db):
     assert "message" in edb.tables()
     rows = edb.query("SELECT content FROM message")
     assert rows[0]["content"] == "你好"
-    assert "page_size" in edb.params
+    assert "page_size=4096" in edb.params
     edb.close()
 
 
@@ -775,12 +841,8 @@ from wechat_export.exceptions import DecryptError
 
 def is_encrypted_db(db_path: Path) -> bool:
     with open(db_path, "rb") as fp:
-        head = fp.read(32)
-    try:
-        sc.parse_header(head)
-    except sc.SqlcipherError:
-        return False
-    return True
+        head = fp.read(100)
+    return not sc.is_plaintext_sqlite(head)
 
 
 class EncryptedDb:
@@ -793,18 +855,15 @@ class EncryptedDb:
                 hint="请确认目标为微信 4.x 数据库",
             )
         data = db_path.read_bytes()
-        try:
-            plain = sc.decrypt_db(data, key_hex)
-        except sc.SqlcipherError as e:
-            raise DecryptError(f"无法解密数据库 {db_path.name}",
-                               hint=str(e)) from e
-        if not plain.startswith(sc.SQLITE_MAGIC):
+        layout = sc.find_layout(data, key_hex)
+        if layout is None:
             raise DecryptError(
-                f"无法解密数据库 {db_path.name}（密钥可能错误）",
+                f"无法解密数据库 {db_path.name}（密钥可能错误或布局不受支持）",
                 hint="请确认密钥正确，或改用 --key-hex 手动提供",
             )
-        page_size, reserved = sc.parse_header(data)
+        page_size, reserved = layout
         self.params = f"page_size={page_size};reserved={reserved}"
+        plain = sc.decrypt_db(data, key_hex, page_size, reserved)
         self.conn = sqlite3.connect(":memory:")
         self.conn.deserialize(plain)
         self._plain = plain  # 保持引用，防止被 GC
@@ -2716,7 +2775,7 @@ python tools/probe_wechat.py --out docs/findings/4x-reverse-notes.md
 - 快照 `message_0.schema.json` 被真实列名覆盖
 - 若 `key_source == "memory"`，把实测到的密钥存放位置/方式记录进 `docs/findings/4x-reverse-notes.md`；若发现**本地落盘密钥**，把路径登记进 `key_provider.LOCAL_KEY_CANDIDATE_RELPATHS` 并补单测
 
-**失败则逐项排查**：数据根目录名（更新 `locator.DATA_DIR_NAMES`）→ db_storage 路径（更新 `locator.DB_STORAGE_NAMES`）→ 密钥（手动 `--key-hex` 验证，若密钥来自第三方 dump 工具）→ 头部/密钥形态（若 4.x 库不符合 raw-key 直用路径，在 `sqlcipher.py` 增加对应分支——以实测为准；页大小/保留区由头部直接读出，不需要枚举）。每项排查修正后补对应单测再继续。
+**失败则逐项排查**：数据根目录名（更新 `locator.DATA_DIR_NAMES`）→ db_storage 路径（更新 `locator.DB_STORAGE_NAMES`）→ 密钥（手动 `--key-hex` 验证，若密钥来自第三方 dump 工具）→ 布局/密钥形态（若 4.x 库不符合 raw-key 直用路径或候选布局之外，在 `sqlcipher.py` 增加对应分支——以实测为准；布局探测由 `find_layout` 枚举完成）。每项排查修正后补对应单测再继续。
 
 - [ ] **Step 5: 依据实测结果更新映射与媒体 resolver 接口**
 
@@ -2777,3 +2836,4 @@ git commit -m "docs: README 与交付说明"
 - **占位符扫描**：媒体二进制解析（Task 9 注）、`LOCAL_KEY_CANDIDATE_RELPATHS` 空表、`_archive_media` 暂标记 missing——均为**留给 M0 实测填充的接口点**，探测脚本（Task 14）定义了填写的具体路径与步骤，非"实现 later"。
 - **类型一致性**：`Message/Media/Session/Contact` 字段、`EncryptedDb.query/tables/columns`、`MediaArchive.save_bytes/save_file`、`KeyProvider.get_key`、`write_session_messages` 等接口在任务间签名一致；`schema.SchemaInfo` 的字段名与 `DEFAULT_MAPPING` 键一致。
 - **评审修订记录（写入后 inline 修复）**：① cli 测试夹具用 `monkeypatch` 固定候选数据根，避免扫到开发机真实微信数据导致测试不确定；② 密钥格式校验提前到定位之前（错误码 1 优先级确定）；③ 内存扫描候选改为高熵过滤（≥16 不同字节），合成测试密钥改为 `bytes(range(32))`，低熵明文不触发解密尝试；④ `collect_dump_candidates` 去掉残留占位变量并限定候选上限；⑤ MiniDump 改用 `CreateFileW` 的 Win32 句柄（fd 不能直接用作 HANDLE）；⑥ cli 计数逻辑重构（`_archive_media` 返回 `(ok, missing)` 元组，report 统一累加）；⑦ probe 写快照时按候选列名推断语义映射，避免写入错误的列名映射；⑧ **v2 解密方案重写**（经需求方确认）：sqlcipher3-binary 无 Windows 轮子、pysqlcipher3-binary 仅有 py3.8 轮（已核实 PyPI），改为纯 Python 逐页 AES-256-CBC 解密（Task 4 sqlcipher.py，路径已对照官方源码）；Task 5 夹具工厂改为"明文建库→加密"，db_access 改为内存 deserialize 读取；Task 1 依赖移除 sqlcipher3-binary。
+- **评审修订记录⑨（页 1 布局实证修正）**：实现轮发现并对照源码定案——SQLCipher 页 1 的[0:16]是明文随机 salt（非魔数），加密区=[16, P-R)，解密时魔数常量注入；页大小/保留区在文件头**不可读**（源码注释），改为候选布局枚举（4096×48 优先）+ 解密后页 1 头部特征校验（页大小字段/版本字节/保留区=0/fraction 常量 0x40 0x20 0x20）。新接口 `find_layout`/`page1_header_ok`。
