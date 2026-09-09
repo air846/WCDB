@@ -970,7 +970,10 @@ def test_message_db_files_sorted(tmp_path):
     assert [f.name for f in files] == ["message_0.db", "message_1.db"]
 
 
-def test_locate_data_with_override(tmp_path):
+def test_locate_data_with_override(tmp_path, monkeypatch):
+    # 固定候选根 = 测试传入的 override，避免扫到本机真实微信数据目录
+    monkeypatch.setattr("wechat_export.locator.candidate_data_roots",
+                        lambda override: [root])
     root = _fake_data_root(tmp_path)
     infos = locate_data(override=root)
     assert [i.wxid for i in infos] == ["wxid_abc"]
