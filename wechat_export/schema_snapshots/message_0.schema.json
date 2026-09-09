@@ -1,0 +1,14 @@
+{
+  "table": "message",
+  "columns": {
+    "message": ["id", "talker", "type", "subtype", "content", "createTime", "isSender", "status"]
+  },
+  "msg_id": "id",
+  "talker": "talker",
+  "type": "type",
+  "subtype": "subtype",
+  "content": "content",
+  "create_time": "createTime",
+  "is_sender": "isSender",
+  "status": "status"
+}
