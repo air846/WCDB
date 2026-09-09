@@ -153,6 +153,47 @@ def decode_v1(data: bytes) -> tuple[bytes, str, bool] | None:
     return None
 
 
+def _import_av():
+    try:
+        import av  # noqa: PLC0415
+        return av
+    except ImportError:
+        return None
+
+
+WXGF_AVAILABLE = _import_av() is not None
+
+
+def decode_wxgf(data: bytes, quality: int = 2) -> tuple[bytes, str] | None:
+    """`wxgf`（微信 HEVC 容器）→ JPEG；需可选依赖 av，失败返回 None。"""
+    av = _import_av()
+    if av is None or not data.startswith(b"wxgf"):
+        return None
+    import fractions
+    import io
+
+    try:
+        with av.open(io.BytesIO(data), format="hevc") as container:
+            frame = next(container.decode(video=0), None)
+    except Exception:  # noqa: BLE001
+        return None
+    if frame is None:
+        return None
+    try:
+        enc = av.CodecContext.create("mjpeg", "w")
+        enc.width, enc.height = frame.width, frame.height
+        enc.pix_fmt = "yuvj420p"
+        enc.time_base = fractions.Fraction(1, 25)
+        enc.options = {"qmin": str(quality), "qmax": str(quality)}
+        packets = enc.encode(frame.reformat(format="yuvj420p"))
+        out = b"".join(bytes(p) for p in packets)
+    except Exception:  # noqa: BLE001
+        return None
+    if not out.startswith(b"\xff\xd8"):
+        return None
+    return out, ".jpg"
+
+
 def decode_raw_aes(data: bytes, aes_key: bytes | None) -> tuple[bytes, str, bool] | None:
     """尝试整文件 AES-ECB（微信表情 Persist/Thumb 疑似同密钥加密）。"""
     if not aes_key or len(aes_key) not in (16, 24, 32) or len(data) < 16:

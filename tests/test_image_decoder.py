@@ -1,7 +1,9 @@
 """图片解码与密钥提取单测（全部使用合成样本，不依赖真机）。"""
 
 import struct
+from pathlib import Path
 
+import pytest
 from Crypto.Cipher import AES
 from Crypto.Util import Padding
 
@@ -179,6 +181,45 @@ def test_collect_oracles(tmp_path):
     oracles = collect_oracles([tmp_path / "a.dat", tmp_path / "b.dat", tmp_path / "c.dat"])
     assert len(oracles) == 2
     assert all(len(ct) == 16 for ct in oracles)
+
+
+WXGF_FIXTURE = Path(__file__).parent / "fixtures" / "sample.wxgf"
+
+
+def test_decode_wxgf():
+    from wechat_export.image_decoder import WXGF_AVAILABLE, decode_wxgf
+    if not WXGF_AVAILABLE:
+        pytest.skip("av 未安装")
+    result = decode_wxgf(WXGF_FIXTURE.read_bytes())
+    assert result is not None
+    jpg, ext = result
+    assert ext == ".jpg" and jpg.startswith(b"\xff\xd8")
+    assert decode_wxgf(b"not a wxgf") is None
+    assert decode_wxgf(b"wxgf" + b"\x00" * 40) is None
+
+
+def test_media_resolver_transcodes_wxgf(tmp_path):
+    import hashlib
+    from wechat_export.image_decoder import WXGF_AVAILABLE
+    if not WXGF_AVAILABLE:
+        pytest.skip("av 未安装")
+    from wechat_export.cli import MediaResolver
+    from wechat_export.exporter.media_archive import MediaArchive
+    from wechat_export.message_model import Media
+
+    wxgf = WXGF_FIXTURE.read_bytes()
+    dat = make_v2(wxgf, aes_size=1024)
+    username = "wxid_test"
+    md5 = "c" * 32
+    attach = (tmp_path / "msg" / "attach"
+              / hashlib.md5(username.encode()).hexdigest() / "2026-01" / "Img")
+    attach.mkdir(parents=True)
+    (attach / f"{md5}.dat").write_bytes(dat)
+    archive = MediaArchive(tmp_path / "out" / "media")
+    resolver = MediaResolver(tmp_path, archive, {}, {}, image_key=KEY)
+    media = resolver.resolve(Media(kind="image", md5=md5), username, 1)
+    assert media.ext == ".jpg"
+    assert (tmp_path / "out" / media.rel_path).read_bytes().startswith(b"\xff\xd8")
 
 
 def test_decode_raw_aes():

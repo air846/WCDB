@@ -18,7 +18,9 @@ from wechat_export.exporter.json_writer import (
     write_sessions_index,
 )
 from wechat_export.exporter.media_archive import MediaArchive, placeholder_media
-from wechat_export.image_decoder import decode_dat, decode_raw_aes, global_xor_key
+from wechat_export.image_decoder import (
+    WXGF_AVAILABLE, decode_dat, decode_raw_aes, decode_wxgf, global_xor_key,
+)
 from wechat_export.key_provider import KeyProvider, parse_key_hex
 from wechat_export.message_model import Media, Message, Session
 from wechat_export.parser import parse_message_row
@@ -60,6 +62,7 @@ class ExportReport:
     media_decoded: int = 0
     errors: list[str] = field(default_factory=list)
     image_key_note: str = ""
+    wxgf_note: str = ""
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -239,6 +242,7 @@ class MediaResolver:
         self.image_key = image_key
         self.xor_key = xor_key
         self.decoded = 0
+        self.wxgf_pending = 0
         self._index: dict[str, Path] | None = None
 
     def _session_index(self, username: str) -> dict[str, Path]:
@@ -271,6 +275,12 @@ class MediaResolver:
             decoded = decode_raw_aes(data, self.image_key)
         if decoded is not None:
             plain, ext, _renderable = decoded
+            if ext == ".wxgf":
+                converted = decode_wxgf(plain)
+                if converted is not None:
+                    plain, ext = converted
+                elif not WXGF_AVAILABLE:
+                    self.wxgf_pending += 1
             self.decoded += 1
             return self.archive.save_bytes(plain, kind, ext, md5=md5)
         return self.archive.save_bytes(data, kind, fallback_ext, md5=md5)
@@ -330,13 +340,21 @@ def _make_session(username: str, contacts: dict[str, str]) -> Session:
                    chat_type="group" if is_group else "single")
 
 
-def _has_undecoded_media(out_dir: Path) -> bool:
-    media = out_dir / "media"
-    if not media.is_dir():
+def _needs_reexport(out_dir: Path, image_key: bytes | None) -> bool:
+    """上次导出没有图片密钥/未装 av，而本次具备条件 → 值得重导。"""
+    from wechat_export.image_decoder import WXGF_AVAILABLE
+
+    if not image_key:
         return False
-    for pattern in ("*.dat", "*.bin", "*.thumb"):
-        if any(media.rglob(pattern)):
-            return True
+    try:
+        stats = json.loads(
+            (out_dir / "session.json").read_text(encoding="utf-8")).get("stats", {})
+    except Exception:  # noqa: BLE001
+        return False
+    if not stats.get("image_key"):
+        return True
+    if WXGF_AVAILABLE and not stats.get("wxgf_available"):
+        return True
     return False
 
 
@@ -447,8 +465,8 @@ def run_export(args: argparse.Namespace) -> ExportReport:
                 continue
             out_dir = out_root / _safe_session_dir(username)
             skip = args.resume and (out_dir / ".done").exists()
-            if skip and image_key and _has_undecoded_media(out_dir):
-                skip = False  # 已有图片密钥，重新导出以解码媒体
+            if skip and _needs_reexport(out_dir, image_key):
+                skip = False  # 上次未解码，本次有图片密钥/av → 重新导出
             if skip:
                 report.skipped += 1
                 session = _resume_session(out_dir) or _make_session(username, contacts)
@@ -477,12 +495,20 @@ def run_export(args: argparse.Namespace) -> ExportReport:
                                          media_name2id, image_key=image_key,
                                          xor_key=xor_key)
                 ok, miss = _archive_media(msgs, resolver, username)
+                archive.prune()
                 report.media_decoded += resolver.decoded
+                if resolver.wxgf_pending and not report.wxgf_note:
+                    report.wxgf_note = (
+                        f"有 {resolver.wxgf_pending} 张 wxgf（微信 HEVC）图片未能转码："
+                        '安装可选依赖后重跑即可：pip install "wechat-export[wxgf]"')
             session = _make_session(username, contacts)
             write_session_messages(out_dir, session, msgs)
             write_session_json(out_dir, session,
                                {"messages": len(msgs), "media_ok": ok,
-                                "media_missing": miss})
+                                "media_missing": miss,
+                                "media_decoded": resolver.decoded if not args.no_media else 0,
+                                "image_key": bool(image_key),
+                                "wxgf_available": WXGF_AVAILABLE})
             renderer.render_session(out_dir, session, msgs, {"messages": len(msgs)})
             report.sessions_done += 1
             report.messages += len(msgs)
@@ -523,6 +549,8 @@ def main(argv: list[str] | None = None) -> int:
               f"（其中解码 {report.media_decoded}），跳过 {report.skipped} 个")
         if report.image_key_note:
             print(f"提示：{report.image_key_note}", file=sys.stderr)
+        if report.wxgf_note:
+            print(f"提示：{report.wxgf_note}", file=sys.stderr)
         print(f"输出目录：{Path(args.out).resolve()}")
         return 0
     except ExportError as e:

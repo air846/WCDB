@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+wxgf = ["av>=12"]          # wxgf（微信 HEVC）图片转 JPEG，需 FFmpeg 库（wheel 自带）
 
 [project.scripts]
 wechat-export = "wechat_export.cli:main"

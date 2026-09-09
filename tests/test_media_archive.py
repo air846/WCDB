@@ -31,3 +31,18 @@ def test_missing_source(tmp_path):
     m = arc.save_file(tmp_path / "nope.jpg", "image", ".jpg", md5="x")
     assert m.status == "missing"
     assert arc.stats["missing"] == 1
+
+
+def test_prune_removes_stale(tmp_path):
+    arc = MediaArchive(tmp_path / "media")
+    stale = tmp_path / "media" / "image" / "old.dat"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"x")
+    (tmp_path / "media" / "image" / ".tmp_leftover").write_bytes(b"x")
+    m = arc.save_bytes(b"aaa", "image", ".jpg", md5="m1")
+    removed = arc.prune()
+    assert removed == 2
+    assert not stale.exists()
+    assert not (tmp_path / "media" / "image" / ".tmp_leftover").exists()
+    assert (tmp_path / m.rel_path).exists()
+    assert arc.stats["pruned"] == 2

@@ -86,12 +86,20 @@ def test_main_resume_keeps_index(tmp_path):
     assert sessions["counts"]["wxid_b"] == 7
 
 
-def test_has_undecoded_media(tmp_path):
+def test_needs_reexport(tmp_path):
     out = tmp_path / "s"
-    assert cli._has_undecoded_media(out) is False
-    (out / "media" / "image").mkdir(parents=True)
-    (out / "media" / "image" / "a.dat").write_bytes(b"x")
-    assert cli._has_undecoded_media(out) is True
+    assert cli._needs_reexport(out, b"k" * 16) is False  # 无 session.json
+    out.mkdir()
+    (out / "session.json").write_text(json.dumps({
+        "id": "s", "name": "S", "stats": {"messages": 1},
+    }), encoding="utf-8")
+    assert cli._needs_reexport(out, b"k" * 16) is True   # 上次无密钥
+    (out / "session.json").write_text(json.dumps({
+        "id": "s", "name": "S",
+        "stats": {"messages": 1, "image_key": True, "wxgf_available": True},
+    }), encoding="utf-8")
+    assert cli._needs_reexport(out, b"k" * 16) is False
+    assert cli._needs_reexport(out, None) is False       # 本次也没有密钥
 
 
 def test_resume_reprocesses_when_image_key_available(tmp_path):

@@ -19,8 +19,9 @@
 - 导出 HTML（气泡视图、按天分组、双主题、零 CDN）、JSON（分块 + `.done` 断点）、
   媒体（图片/视频/语音/表情按 md5 去重归档）
 - **图片解码**：微信 4.x 的 `V2 .dat`（AES-128-ECB + 单字节 XOR）自动解码为
-  `.jpg/.png/.gif/.webp`，旧版单字节 XOR `.dat` 同样兼容；图片密钥优先从
-  `Weixin.exe` 进程内存自动提取（也可 `--image-key` 手动提供）
+  `.jpg/.png/.gif/.webp`，旧版单字节 XOR `.dat` 同样兼容；`wxgf`（HEVC 容器）在
+  安装可选依赖 `av` 后自动转 JPEG；图片密钥优先从 `Weixin.exe` 进程内存自动提取
+  （也可 `--image-key` 手动提供）
 - `--resume` 断点续导
 
 ## 安装
@@ -33,6 +34,12 @@ pip install -e ".[dev]"
 
 依赖：`pycryptodome`（AES）、`jinja2`（HTML 模板）、`zstandard`（解压压缩消息）、
 `pytest`（开发）。
+
+可选：`av`（wxgf/HEVC 图片转 JPEG；多数微信 4.x 整图是 wxgf，建议安装）：
+
+```bash
+pip install -e ".[dev,wxgf]"
+```
 
 ## 用法
 
@@ -120,7 +127,10 @@ wechat-export --out ./chat_export --keys-file keys.json
 - 仅实测微信 4.1.13.63；其他 4.x 小版本的 codec 结构/pad 可能不同（脚本会明确报错）
 - **图片密钥**：微信仅在解码图片时把 16 字节 AES 密钥加载进内存，因此自动提取前
   需先在微信里**点开任意一张聊天图片**；否则请用 `--image-key` 手动提供
-- 图片格式为 `wxgf`（微信自有 HEVC 容器）时仅原样归档，浏览器无法直接渲染
+- **wxgf 图片**：多数微信 4.x 整图是 wxgf（HEVC 容器），安装可选依赖 `av` 后会自动
+  转成 JPEG；未安装或少数 HEIC 变体转码失败时保留 `.wxgf` 下载链接
+- **自定义表情**：`business/emoticon/Persist` 使用微信自有加密（与图片密钥不同），
+  暂未解码，以 `.bin` 原样归档
 - 视频/文件类媒体仅能归档已下载到本机的文件；未下载的标记 `missing`
 - 语音以 `.silk` 原样归档
 - 群成员显示名/头像等更丰富的联系人信息可后续增强
@@ -130,7 +140,8 @@ wechat-export --out ./chat_export --keys-file keys.json
 - **图片加载不出来**：① 确认 HTML 用浏览器直接打开且 `media/` 目录与 `index.html`
   同级；② 若 `media/image/` 下仍是 `.dat`，说明导出时没有图片密钥——先在微信里点开
   一张图片，再 `wechat-export --out ./chat_export --resume`（会自动重导未解码会话），
-  或 `--image-key` 手动提供；③ `.wxgf` 是微信自有格式，需转码后才能预览
+  或 `--image-key` 手动提供；③ 若仍是 `.wxgf`，安装 `av` 后重跑
+  （`pip install "wechat-export[wxgf]"`）
 - **找不到数据目录**：用 `--data-dir` 指定数据根（`...\xwechat_files`）
 - **密钥提取失败**：确认微信已登录并保持运行；或 `--key-hex` / `--keys-file` 手动提供
 - **图片密钥提取失败**：先在微信中打开一张聊天图片（点开大图）再重试，或加

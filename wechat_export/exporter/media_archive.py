@@ -29,8 +29,9 @@ def placeholder_media(media: Media) -> Media:
 class MediaArchive:
     def __init__(self, media_root: Path):
         self.media_root = Path(media_root)
-        self._saved: set[str] = set()
-        self.stats = {"saved": 0, "duplicated": 0, "missing": 0}
+        self._saved: set[tuple[str, str]] = set()
+        self._files: set[str] = set()
+        self.stats = {"saved": 0, "duplicated": 0, "missing": 0, "pruned": 0}
 
     def _store(self, data: bytes, kind: str, ext: str, md5: str) -> Media | None:
         kind_dir = KIND_DIRS.get(kind)
@@ -38,7 +39,8 @@ class MediaArchive:
             return None
         digest = md5 or _md5_of_bytes(data)
         rel_path = f"media/{kind_dir}/{digest}{ext}"
-        if digest in self._saved:
+        self._files.add(f"{kind_dir}/{digest}{ext}")
+        if (kind_dir, digest) in self._saved:
             self.stats["duplicated"] += 1
             return Media(kind=kind, md5=digest, size=len(data), ext=ext,
                          rel_path=rel_path)
@@ -55,10 +57,28 @@ class MediaArchive:
         except OSError:
             tmp.unlink(missing_ok=True)
             return None
-        self._saved.add(digest)
+        self._saved.add((kind_dir, digest))
         self.stats["saved"] += 1
         return Media(kind=kind, md5=digest, size=len(data), ext=ext,
                      rel_path=rel_path)
+
+    def prune(self) -> int:
+        """删除本轮未写入的旧媒体文件（例如上次未解码的 .dat/.wxgf）。"""
+        removed = 0
+        if not self.media_root.is_dir():
+            return 0
+        for kind_dir in KIND_DIRS.values():
+            directory = self.media_root / kind_dir
+            if not directory.is_dir():
+                continue
+            for path in directory.iterdir():
+                if not path.is_file():
+                    continue
+                if path.name.startswith(".tmp_") or f"{kind_dir}/{path.name}" not in self._files:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+        self.stats["pruned"] += removed
+        return removed
 
     def save_bytes(self, data: bytes, kind: str, ext: str, md5: str = "") -> Media:
         media = self._store(data, kind, ext, md5)
