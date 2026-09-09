@@ -1,0 +1,17 @@
+{% extends "base.html.j2" %}
+{% block title %}会话列表 · 聊天记录导出{% endblock %}
+{% block head_title %}聊天记录导出{% endblock %}
+{% block content %}
+<p class="muted">账号：{{ meta.account }} · 导出时间：{{ meta.created_at }} · 会话 {{ sessions|length }} 个 · 消息 {{ total_messages }} 条</p>
+<table style="width:100%;border-collapse:collapse">
+  <tr style="text-align:left"><th>会话</th><th>类型</th><th>消息数</th><th></th></tr>
+  {% for s in sessions %}
+  <tr>
+    <td>{{ s.name|e }}</td>
+    <td>{{ "群聊" if s.chat_type=="group" else "单聊" }}</td>
+    <td>{{ counts.get(s.id, 0) }}</td>
+    <td><a href="{{ s.id }}/index.html">打开</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

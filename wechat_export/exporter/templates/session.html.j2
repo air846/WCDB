@@ -1,0 +1,31 @@
+{% extends "base.html.j2" %}
+{% block title %}{{ session.name }} · 聊天记录{% endblock %}
+{% block head_title %}{{ session.name|e }}{% endblock %}
+{% block content %}
+<p class="muted">{{ messages_count }} 条消息 · <a href="../index.html">← 返回会话列表</a></p>
+{% for day, msgs in days %}
+<h3 class="muted">{{ day }}</h3>
+{% for m in msgs %}
+{% set is_out = m.direction == "out" %}
+<div style="display:flex;margin:10px 0;{{ 'justify-content:flex-end' if is_out else '' }}">
+  <div style="max-width:70%;background:{{ 'var(--bubble-out)' if is_out else 'var(--bubble-in)' }};
+              border:1px solid var(--border);border-radius:8px;padding:8px 12px">
+    <div class="muted">{{ m.sender.name|e }}</div>
+    {% if m.media and m.media.status == "ok" and m.media.kind == "image" %}
+      <img src="{{ m.media.rel_path }}" onclick="zoom(this)" loading="lazy" alt="图片">
+    {% elif m.media and m.media.status == "ok" and m.media.kind == "video" %}
+      <video src="{{ m.media.rel_path }}" controls preload="metadata"></video>
+    {% elif m.media and m.media.status == "ok" and m.media.kind == "voice" %}
+      <audio src="{{ m.media.rel_path }}" controls preload="metadata"></audio>
+    {% elif m.media and m.media.status == "ok" and m.media.kind == "file" %}
+      <a href="{{ m.media.rel_path }}">下载文件 {{ m.media.ext }}</a>
+    {% elif m.raw %}
+      <div class="muted">[{{ m.type_name }}] {{ m.content }}</div>
+    {% else %}
+      <div>{{ m.content }}</div>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
+{% endfor %}
+{% endblock %}
