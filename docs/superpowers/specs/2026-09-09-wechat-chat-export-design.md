@@ -41,7 +41,7 @@ Windows 桌面版微信将聊天记录存储在 SQLCipher 加密的 SQLite 数�
 对策：
 - 里程碑 M0 为**解密可行性验证（spike）**：在本机定位数据目录 → 提取密钥 → 打开 `message_0.db` → 读出真实消息。验证通过再铺开正式实现。
 - 密钥提取采用三级兜底策略（见 §4）。
-- SQLCipher 参数采用枚举验证法（见 §4）。
+- SQLCipher 读取路径已按官方源码核实，M0 实测确认（见 §4）。
 - 验证产物为《4.x 逆向验证报告》与 schema 快照，存入仓库供后续实现与测试使用。
 
 ## 3. 整体架构
@@ -63,7 +63,7 @@ locator（定位账号/数据目录/会话列表）
 |---|---|---|
 | `locator` | 定位安装/数据目录、账号(wxid)列表、会话列表 | 无 |
 | `key_provider` | 三级策略提取 32 字节密钥 | 无 |
-| `db_access` | 用 SQLCipher 参数组合只读打开库，提供查询接口 | sqlcipher3-binary |
+| `db_access` | 纯 Python 解密到内存（sqlite3 deserialize）+ 只读查询 | pycryptodome + stdlib sqlite3 |
 | `schema` | 4.x 库表/字段映射（M0 后固化，含快照） | 无 |
 | `message_model` | Contact/Session/Media/Message 数据类 | 无 |
 | `parser` | 原始行 → 消息模型，按消息类型分支 | message_model |
@@ -103,8 +103,7 @@ D:/code/WCDB/
 
 ### 依赖选型
 
-- `sqlcipher3-binary`：SQLCipher 绑定（Windows 自带编译产物），不可用则备选 `pysqlcipher3`
-- `pycryptodome`：AES/HMAC/哈希，密钥校验与派生
+- `pycryptodome`：纯 Python 实现 SQLCipher 逐页 AES-256-CBC 解密。依据官方源码（sqlcipher/src/sqlcipher.c）核实：raw key 直作 AES 密钥（不经 PBKDF2）、每页 IV 存于该页保留区前 16 字节、页大小与保留区大小明文记录于文件头（偏移 16/20）。**无 SQLCipher 原生绑定依赖**——`sqlcipher3-binary` 从未发布 Windows 轮子、`pysqlcipher3-binary` 仅有 py3.8 轮的 Windows 轮子，均已排除
 - `jinja2`：HTML 模板渲染
 - 参数解析用标准库 `argparse`（不额外引入 click）
 
@@ -125,15 +124,17 @@ D:/code/WCDB/
 3. 手动输入兜底   — 用户提供 32 字节 hex key 时直接录入（--key-hex 参数）
 ```
 
-### SQLCipher 参数发现（枚举验证法）
+### SQLCipher 读取路径（已按官方源码核实）
 
-- 对候选参数组合（页面大小 / KDF 迭代 / HMAC 算法等）逐一尝试 `PRAGMA key` 打开
-- 判据：能读出已知真实文本行
-- 确认后的参数固化进 `schema.py`，供正式版本与夹具库生成使用
+- 页大小 = 文件头偏移 16 的大端 uint16（1=65536）；保留区大小 = 偏移 20 的字节；两者均明文
+- 原始 32 字节密钥（`x'...'`）**直接作为 AES-256-CBC 密钥**，不经过 PBKDF2（raw key 分支）
+- 每页 IV = 该页保留区前 16 字节（明文存储）；解密仅需逐页 AES 解密，**不验证 HMAC**（仅完整性用途）
+- 解密后的明文 SQLite 只存在于内存（stdlib `sqlite3.Connection.deserialize`），不写盘，头部保留区字节清零
+- M0 实测确认 4.x 库符合此路径；若实测偏离（如非 raw key），按实测在 `sqlcipher.py` 增加分支并更新本 spec
 
 ### 读写安全
 
-- 全程只读原始库文件：sqlcipher3-binary 直接以密钥打开加密文件
+- 全程只读原始库文件：纯 Python 逐页 AES-256-CBC 解密（pycryptodome），解密明文仅驻内存
 - 不写解密副本落盘；任何临时文件用完即删
 - 数据仅本机处理，不联网
 

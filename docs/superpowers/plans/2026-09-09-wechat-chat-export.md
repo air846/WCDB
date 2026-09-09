@@ -4,15 +4,16 @@
 
 **Goal:** 用 Python 构建一个 CLI 工具，从 Windows 微信 4.x 本机数据目录解密聊天数据库，全量导出为 HTML 会话视图 + 结构化 JSON + 媒体文件。
 
-**Architecture:** 分层流水线：`locator`（定位数据）→ `key_provider`（提取密钥）→ `db_access`（SQLCipher 只读打开库）→ `parser`（行→统一消息模型）→ `exporter`（JSON/媒体/HTML 三件套）→ `cli`（编排）。关键不确定性（4.x 密钥位置与 SQLCipher 参数）通过 M0 探测脚本在本机实测确认，测试用合成加密夹具库保证可复现。
+**Architecture:** 分层流水线：`locator`（定位数据）→ `key_provider`（提取密钥）→ `db_access`（纯 Python 解密到内存 + 只读查询）→ `parser`（行→统一消息模型）→ `exporter`（JSON/媒体/HTML 三件套）→ `cli`（编排）。关键不确定性（4.x 密钥位置与 SQLCipher 参数）通过 M0 探测脚本在本机实测确认，测试用合成加密夹具库保证可复现。
 
-**Tech Stack:** Python 3.10+、`sqlcipher3-binary`（备选 `pysqlcipher3`）、`pycryptodome`、`jinja2`、`pytest`、标准库 `argparse`/`ctypes`/`pathlib`。
+**Tech Stack:** Python 3.10+、`pycryptodome`（纯 Python SQLCipher 页解密）、`jinja2`、`pytest`、标准库 `sqlite3`/`argparse`/`ctypes`/`pathlib`。
 
 **Spec:** `docs/superpowers/specs/2026-09-09-wechat-chat-export-design.md`
 
 ## Global Constraints
 
 - 仅支持 Windows 桌面版微信 **4.x**
+- 解密为纯 Python 实现（`pycryptodome` 逐页 AES-256-CBC），**无 SQLCipher 原生绑定依赖**；解密明文仅存在于内存（sqlite3 deserialize），不写盘
 - 全程只读打开原始库；**不写解密副本落盘**；任何临时文件用完即删；不联网
 - 所有用户可见错误信息为**中文**，格式：发生了什么 + 可能原因 + 建议操作
 - 错误码：0 成功 / 1 参数错误 / 2 未找到微信 / 3 密钥失败 / 4 解密失败 / 5 导出部分失败
@@ -33,7 +34,8 @@ D:/code/WCDB/
 │   ├── cli.py                        # 参数解析 + 编排 + 错误码 + 报告
 │   ├── locator.py                    # 数据目录/账号/db 文件定位
 │   ├── key_provider.py               # 三级密钥提取 + 校验
-│   ├── db_access.py                  # SQLCipher 参数枚举 + 只读查询
+│   ├── sqlcipher.py                  # 纯 Python SQLCipher 页加解密（pycryptodome）
+│   ├── db_access.py                  # 解密到内存 + 只读查询（sqlite3 deserialize）
 │   ├── schema.py                     # 表结构知识 + 快照加载
 │   ├── message_model.py              # Contact/Session/Media/Message
 │   ├── parser.py                     # 行 → 消息模型
@@ -82,7 +84,7 @@ D:/code/WCDB/
 
 **Interfaces:**
 - Consumes: 无
-- Produces: `wechat_export.__version__ = "0.1.0"`；pytest 可运行；`sqlcipher3` 可导入（失败时给出清晰中文错误）
+- Produces: `wechat_export.__version__ = "0.1.0"`；pytest 可运行；`pycryptodome` 可导入（失败时给出清晰中文错误）
 
 - [ ] **Step 1: 检查 Python 环境**
 
@@ -102,7 +104,6 @@ version = "0.1.0"
 description = "Windows 微信 4.x 聊天记录全量导出工具（HTML + JSON + 媒体）"
 requires-python = ">=3.10"
 dependencies = [
-    "sqlcipher3-binary>=0.5.3",
     "pycryptodome>=3.20",
     "jinja2>=3.1",
 ]
@@ -157,15 +158,9 @@ source .venv/Scripts/activate    # Git Bash；若用 cmd：.venv\Scripts\activat
 pip install -e ".[dev]"
 ```
 
-如果 `sqlcipher3-binary` 安装失败，改用备选：
+依赖说明：SQLCipher 解密为纯 Python 实现（pycryptodome），无原生绑定依赖；若 pycryptodome 安装失败请中断并报告。
 
-```bash
-pip install pysqlcipher3 "pysqlcipher3-binary" 2>/dev/null || pip install "pysqlcipher3-binary"
-```
-
-（`db_access.py` 会同时兼容两类导入名，见 Task 5。）
-
-- [ ] **Step 6: 写冒烟测试验证 sqlcipher3 可用**
+- [ ] **Step 6: 写冒烟测试验证 pycryptodome 可用**
 
 `tests/test_smoke.py`：
 
@@ -177,14 +172,14 @@ def test_version():
     assert wechat_export.__version__ == "0.1.0"
 
 
-def test_sqlcipher_importable():
-    import sqlcipher3  # noqa: F401
+def test_pycryptodome_importable():
+    from Crypto.Cipher import AES  # noqa: F401
 ```
 
 - [ ] **Step 7: 运行测试**
 
 Run: `pytest -q`
-Expected: 2 passed。（若 sqlcipher3 导入失败，先解决依赖再继续——这是全局硬依赖。）
+Expected: 2 passed。
 
 - [ ] **Step 8: Commit**
 
@@ -450,84 +445,206 @@ git commit -m "feat: 统一消息模型"
 
 ---
 
-### Task 4: 合成加密夹具库工厂（db_factory）
+### Task 4: 纯 Python SQLCipher 加解密（sqlcipher.py）
 
 **Files:**
-- Create: `tests/fixtures/__init__.py`
-- Create: `tests/fixtures/db_factory.py`
-- Create: `tests/conftest.py`
-- Test: `tests/test_db_factory.py`
+- Create: `wechat_export/sqlcipher.py`
+- Test: `tests/test_sqlcipher.py`
 
 **Interfaces:**
-- Consumes: 无（独立于产品代码，仅依赖 sqlcipher3）
-- Produces：
-  - `PARAM_SET_DEFAULT = {"label": "sqlcipher4-default", "pragmas": "cipher_page_size=4096;kdf_iter=256000;cipher_hmac_algorithm=HMAC_SHA512"}`
-  - `PARAM_SET_WX3 = {"label": "wx3-style", "pragmas": "cipher_page_size=4096;kdf_iter=64000;cipher_hmac_algorithm=HMAC_SHA1"}`
-  - `def create_encrypted_db(path: Path, key_hex: str, pragmas: str) -> "connection"`：建库、设密钥与参数、创建 message 表并返回连接
-  - `def make_message_schema() -> dict`：返回 `{"table": "message", "columns": {...}}`（与默认快照一致的列名字典，见 Task 8）
-  - `def insert_message(conn, *, msg_id, ts, type_, content, is_sender, talker, subtype=0, **extra)`
-  - `def close(conn)`
+- Consumes: 无（仅依赖 pycryptodome）
+- Produces（解密路径已按 SQLCipher 官方源码 src/sqlcipher.c 核实）：
+  - `SQLITE_MAGIC = b"SQLite format 3\x00"`、`IV_SIZE = 16`、`KEY_SIZE = 32`
+  - `class SqlcipherError(Exception)`
+  - `def parse_header(data: bytes) -> tuple[int, int]`：返回 (page_size, reserved)；页大小=偏移16 大端 uint16（值 1 表示 65536），保留区=偏移 20 字节；魔数不符/无保留区/`(page_size-reserved) % 16 != 0` 抛 `SqlcipherError`
+  - `def decrypt_db(data: bytes, key_hex: str) -> bytes`：逐页 AES-256-CBC（密钥=raw 32 字节，IV=该页保留区前 16 字节）解密，拼出明文 SQLite（头部字节 20 清零）；明文大小须为页大小整数倍；密钥非 32 字节抛 `SqlcipherError`
+  - `def encrypt_db(plain: bytes, key_hex: str, page_size: int = 4096, reserved: int = 48) -> bytes`：明文 SQLite → SQLCipher 加密文件（测试夹具生成用；每页写入随机 IV + 随机填充保留区，供 decrypt_db 读取）
 
 - [ ] **Step 1: 写失败测试**
 
-`tests/test_db_factory.py`：
+`tests/test_sqlcipher.py`：
 
 ```python
 import sqlite3
 
-from tests.fixtures import db_factory as f
+import pytest
 
-KEY = "a" * 64  # 32 字节 hex
+from wechat_export import sqlcipher as sc
+
+KEY = "ab" * 32
 
 
-def test_create_encrypted_db_and_query(tmp_path):
-    db = tmp_path / "m.db"
-    conn = f.create_encrypted_db(db, KEY, f.PARAM_SET_DEFAULT["pragmas"])
-    conn.execute("CREATE TABLE message (id INTEGER PRIMARY KEY, content TEXT)")
-    f.insert_message(conn, msg_id=1, ts=1700000000000, type_=1,
-                     content="hello", is_sender=0, talker="wxid_b")
-    cur = conn.execute("SELECT COUNT(*) FROM message")
-    assert cur.fetchone()[0] == 1
-    f.close(conn)
+def _make_plain_sqlite(tmp_path) -> bytes:
+    p = tmp_path / "p.db"
+    conn = sqlite3.connect(str(p))
+    conn.execute("CREATE TABLE t (a TEXT)")
+    conn.execute("INSERT INTO t VALUES ('你好')")
+    conn.commit()
+    conn.close()
+    return p.read_bytes()
 
-    # 重新以密钥打开验证持久化
-    import sqlcipher3
-    conn2 = sqlcipher3.connect(str(db))
-    conn2.execute(f'PRAGMA key="x\'{KEY}\'"')
-    conn2.execute("PRAGMA cipher_page_size=4096")
-    conn2.execute("PRAGMA kdf_iter=256000")
-    conn2.execute("PRAGMA cipher_hmac_algorithm=HMAC_SHA512")
-    rows = conn2.execute("SELECT content FROM message").fetchall()
-    assert rows == [("hello",)]
-    conn2.close()
+
+def test_roundtrip(tmp_path):
+    plain = _make_plain_sqlite(tmp_path)
+    enc = sc.encrypt_db(plain, KEY)
+    dec = sc.decrypt_db(enc, KEY)
+    assert dec[:16] == sc.SQLITE_MAGIC
+    assert dec[20] == 0  # 保留区字节已清零
+    conn = sqlite3.connect(":memory:")
+    conn.deserialize(dec)
+    assert conn.execute("SELECT a FROM t").fetchall() == [("你好",)]
+    conn.close()
+
+
+def test_wrong_key_yields_garbage(tmp_path):
+    plain = _make_plain_sqlite(tmp_path)
+    enc = sc.encrypt_db(plain, KEY)
+    dec = sc.decrypt_db(enc, "cd" * 32)
+    assert dec[:16] != sc.SQLITE_MAGIC
+
+
+def test_parse_header_rejects_plain_sqlite(tmp_path):
+    plain = _make_plain_sqlite(tmp_path)
+    with pytest.raises(sc.SqlcipherError):
+        sc.parse_header(plain)
+
+
+def test_bad_key_length_raises(tmp_path):
+    plain = _make_plain_sqlite(tmp_path)
+    with pytest.raises(sc.SqlcipherError):
+        sc.encrypt_db(plain, "a" * 10)
 ```
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `pytest tests/test_db_factory.py -v`
-Expected: FAIL, ImportError: cannot import name 'create_encrypted_db'
+Run: `pytest tests/test_sqlcipher.py -v`
+Expected: FAIL，ImportError: cannot import name 'sqlcipher'
 
-- [ ] **Step 3: 实现 db_factory.py**
+- [ ] **Step 3: 实现 sqlcipher.py**
 
 ```python
-"""合成 SQLCipher 加密夹具库生成器——所有解密相关测试的基础设施。
+"""纯 Python SQLCipher 页加解密（pycryptodome）。
 
-建库时使用与真实库一致的调用模式（先 PRAGMA key，再设参数），
-保证 Task 5 的参数枚举能解出这些库里创建的库。
+解密路径依据 SQLCipher 官方源码（src/sqlcipher.c）核实：
+- 原始 32 字节密钥（PRAGMA key = "x'...'"）直接作为 AES-256 密钥，不经 PBKDF2
+- 文件头前 16 字节为明文魔数（raw key 模式不需要 KDF salt）
+- 页大小 = 头部偏移 16 大端 uint16（1=65536）；保留区大小 = 偏移 20 字节
+- 每页前 (页大小-保留区) 字节用 AES-256-CBC(密钥, 该页 IV) 加密；
+  IV = 该页保留区前 16 字节（明文存储），HMAC 仅用于完整性，读取时忽略
+- 解密输出为明文 SQLite：头部保留区字节清零，防 sqlite 按旧偏移读页
 """
 
+import os
+from Crypto.Cipher import AES
+
+SQLITE_MAGIC = b"SQLite format 3\x00"
+IV_SIZE = 16
+KEY_SIZE = 32
+
+
+class SqlcipherError(Exception):
+    pass
+
+
+def parse_header(data: bytes) -> tuple[int, int]:
+    if len(data) < 32 or data[:16] != SQLITE_MAGIC:
+        raise SqlcipherError("不是有效的 SQLCipher/SQLite 文件头")
+    page_size = int.from_bytes(data[16:18], "big")
+    if page_size == 1:
+        page_size = 65536
+    reserved = data[20]
+    if reserved == 0 or reserved < IV_SIZE:
+        raise SqlcipherError("文件头显示无保留区（疑似明文 SQLite，或非 SQLCipher）")
+    if (page_size - reserved) % 16 != 0:
+        raise SqlcipherError("页大小与保留区不匹配（疑似非 SQLCipher 布局）")
+    return page_size, reserved
+
+
+def _parse_key(key_hex: str) -> bytes:
+    raw = bytes.fromhex(key_hex)
+    if len(raw) != KEY_SIZE:
+        raise SqlcipherError(f"密钥必须为 {KEY_SIZE} 字节")
+    return raw
+
+
+def decrypt_db(data: bytes, key_hex: str) -> bytes:
+    page_size, reserved = parse_header(data)
+    key = _parse_key(key_hex)
+    if len(data) % page_size != 0:
+        raise SqlcipherError("文件大小不是页大小的整数倍")
+    out = bytearray()
+    for off in range(0, len(data), page_size):
+        page = data[off:off + page_size]
+        iv = page[page_size - reserved:page_size - reserved + IV_SIZE]
+        ct = page[:page_size - reserved]
+        out += AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
+    out[20] = 0  # 明文库保留区字节清零
+    return bytes(out)
+
+
+def encrypt_db(plain: bytes, key_hex: str, page_size: int = 4096,
+               reserved: int = 48) -> bytes:
+    """明文 SQLite 文件 → SQLCipher 加密文件（夹具库生成用）。"""
+    key = _parse_key(key_hex)
+    if len(plain) % page_size != 0:
+        raise SqlcipherError("明文大小不是页大小的整数倍")
+    out = bytearray()
+    for off in range(0, len(plain), page_size):
+        page = bytearray(plain[off:off + page_size])
+        page[16:18] = page_size.to_bytes(2, "big")
+        if off == 0:
+            page[20] = reserved
+        iv = os.urandom(IV_SIZE)
+        ct = AES.new(key, AES.MODE_CBC, iv).encrypt(bytes(page[:page_size - reserved]))
+        out += ct
+        out += iv + os.urandom(reserved - IV_SIZE)
+    return bytes(out)
+```
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `pytest tests/test_sqlcipher.py -v`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add wechat_export/sqlcipher.py tests/test_sqlcipher.py
+git commit -m "feat: 纯 Python SQLCipher 页加解密"
+```
+
+---
+
+### Task 5: 合成加密夹具工厂 + 只读访问（db_factory + db_access.py）
+
+**Files:**
+- Create: `tests/fixtures/__init__.py`、`tests/fixtures/db_factory.py`、`tests/conftest.py`
+- Create: `wechat_export/db_access.py`
+- Test: `tests/test_db_access.py`
+
+**Interfaces:**
+- Consumes: `wechat_export.sqlcipher`（Task 4）、`exceptions.DecryptError`
+- Produces：
+  - factory：`create_encrypted_db(path: Path, key_hex: str, page_size=4096, reserved=48) -> None`（stdlib sqlite3 建明文含 message 表 → encrypt_db → 覆盖写入）；`insert_message(db_path: Path, *, key_hex: str, msg_id: int, ts: int, type_: int, content: str, is_sender: int, talker: str, subtype: int = 0, status: int = 0) -> None`（解密→插入→再加密）；`make_message_schema() -> dict` 同旧定义
+  - `def is_encrypted_db(db_path: Path) -> bool`
+  - `class EncryptedDb(db_path: Path, key_hex: str)`：解密到内存并 `sqlite3.deserialize`，**不写盘**；属性 `params: str`（`page_size=..;reserved=..`）；方法 `tables() / columns(table) / query(sql, args=()) -> list[dict] / close()`；头部非法/解密失败/魔数校验失败抛 `DecryptError`
+  - `def open_encrypted(db_path: Path, key_hex: str) -> EncryptedDb`
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/fixtures/db_factory.py`（本步先写，作为基础设施）：
+
+```python
+"""合成 SQLCipher 加密夹具库生成器：stdlib sqlite3 建明文 → sqlcipher.encrypt_db 加密。"""
+
+import sqlite3
 from pathlib import Path
 
-import sqlcipher3
+from wechat_export import sqlcipher as sc
 
-PARAM_SET_DEFAULT = {
-    "label": "sqlcipher4-default",
-    "pragmas": "cipher_page_size=4096;kdf_iter=256000;cipher_hmac_algorithm=HMAC_SHA512",
-}
-PARAM_SET_WX3 = {
-    "label": "wx3-style",
-    "pragmas": "cipher_page_size=4096;kdf_iter=64000;cipher_hmac_algorithm=HMAC_SHA1",
-}
+KEY = "ab" * 32
+FIXTURE_PAGE_SIZE = 4096
+FIXTURE_RESERVED = 48
 
 MSG_COLUMNS = {
     "id": "INTEGER PRIMARY KEY",
@@ -545,30 +662,37 @@ def make_message_schema() -> dict:
     return {"table": "message", "columns": MSG_COLUMNS}
 
 
-def create_encrypted_db(path: Path, key_hex: str, pragmas: str):
-    conn = sqlcipher3.connect(str(path))
-    conn.execute(f'PRAGMA key="x\'{key_hex}\'"')
-    for p in pragmas.split(";"):
-        conn.execute(f"PRAGMA {p}")
+def create_encrypted_db(path: Path, key_hex: str = KEY,
+                        page_size: int = FIXTURE_PAGE_SIZE,
+                        reserved: int = FIXTURE_RESERVED) -> None:
+    plain_path = path.with_name(path.name + ".plain")
+    conn = sqlite3.connect(str(plain_path))
     cols = ", ".join(f"{k} {v}" for k, v in MSG_COLUMNS.items())
     conn.execute(f"CREATE TABLE message ({cols})")
     conn.commit()
-    return conn
+    conn.close()
+    plain = plain_path.read_bytes()
+    plain_path.unlink()
+    path.write_bytes(sc.encrypt_db(plain, key_hex, page_size, reserved))
 
 
-def insert_message(conn, *, msg_id: int, ts: int, type_: int, content: str,
-                   is_sender: int, talker: str, subtype: int = 0,
-                   status: int = 0):
+def insert_message(db_path: Path, *, key_hex: str = KEY, msg_id: int, ts: int,
+                   type_: int, content: str, is_sender: int, talker: str,
+                   subtype: int = 0, status: int = 0) -> None:
+    plain = sc.decrypt_db(db_path.read_bytes(), key_hex)
+    tmp = db_path.with_name(db_path.name + ".plain")
+    tmp.write_bytes(plain)
+    conn = sqlite3.connect(str(tmp))
     conn.execute(
         "INSERT INTO message (id, talker, type, subtype, content, createTime, isSender, status)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (msg_id, talker, type_, subtype, content, ts, is_sender, status),
     )
     conn.commit()
-
-
-def close(conn):
     conn.close()
+    enc = sc.encrypt_db(tmp.read_bytes(), key_hex)
+    tmp.unlink()
+    db_path.write_bytes(enc)
 ```
 
 `tests/conftest.py`：
@@ -580,41 +704,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 ```
 
-- [ ] **Step 4: 运行确认通过**
-
-Run: `pytest tests/test_db_factory.py -v`
-Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add tests/fixtures tests/conftest.py tests/test_db_factory.py
-git commit -m "test: 合成 SQLCipher 加密夹具库工厂"
-```
-
----
-
-### Task 5: SQLCipher 参数枚举与只读访问（db_access.py）
-
-**Files:**
-- Create: `wechat_export/db_access.py`
-- Test: `tests/test_db_access.py`
-
-**Interfaces:**
-- Consumes: `tests.fixtures.db_factory`（仅测试用）；无产品代码依赖
-- Produces：
-  - `SQLCIPHER_PARAM_CANDIDATES: list[str]`——候选 pragma 串
-  - `class EncryptedDb:` 构造 `(db_path: Path, key_hex: str)`；自动尝试候选参数打开；失败抛 `DecryptError`
-    - `conn`：只读 sqlite 连接（`mode=ro`）
-    - `params: str`：成功时使用的 pragma 串
-    - `def query(sql, args=()) -> list[dict]`
-    - `def tables() -> list[str]`
-    - `def columns(table) -> list[str]`
-  - `def open_encrypted(db_path, key_hex) -> EncryptedDb`
-  - `def is_encrypted_db(db_path) -> bool`（读首 16 字节，"SQLite format 3" 头缺失则视为加密库；存在则报错——WeChat 4.x 库必加密）
-
-- [ ] **Step 1: 写失败测试**
-
 `tests/test_db_access.py`：
 
 ```python
@@ -624,97 +713,74 @@ from tests.fixtures import db_factory as f
 from wechat_export.db_access import EncryptedDb, open_encrypted
 from wechat_export.exceptions import DecryptError
 
-KEY = "b" * 64
+KEY = f.KEY
 
 
 @pytest.fixture
 def encrypted_db(tmp_path):
     db = tmp_path / "message_0.db"
-    conn = f.create_encrypted_db(db, KEY, f.PARAM_SET_DEFAULT["pragmas"])
-    f.insert_message(conn, msg_id=1, ts=1700000000000, type_=1,
+    f.create_encrypted_db(db, KEY)
+    f.insert_message(db, key_hex=KEY, msg_id=1, ts=1700000000000, type_=1,
                      content="你好", is_sender=0, talker="wxid_b")
-    f.close(conn)
     return db
 
 
-def test_open_with_default_params(encrypted_db):
+def test_open_and_query(encrypted_db):
     edb = EncryptedDb(encrypted_db, KEY)
     assert "message" in edb.tables()
     rows = edb.query("SELECT content FROM message")
     assert rows[0]["content"] == "你好"
+    assert "page_size" in edb.params
     edb.close()
 
 
 def test_wrong_key_raises_decrypt_error(encrypted_db):
     with pytest.raises(DecryptError):
-        open_encrypted(encrypted_db, "c" * 64)
-
-
-def test_query_is_readonly(encrypted_db):
-    edb = open_encrypted(encrypted_db, KEY)
-    with pytest.raises(Exception):
-        edb.query("CREATE TABLE x (a)")
-    edb.close()
+        open_encrypted(encrypted_db, "cd" * 32)
 
 
 def test_columns(encrypted_db):
     edb = open_encrypted(encrypted_db, KEY)
     assert "content" in edb.columns("message")
     edb.close()
+
+
+def test_plain_sqlite_rejected(tmp_path):
+    import sqlite3
+    db = tmp_path / "plain.db"
+    sqlite3.connect(str(db)).close()
+    with pytest.raises(DecryptError):
+        open_encrypted(db, KEY)
 ```
 
 - [ ] **Step 2: 运行确认失败**
 
 Run: `pytest tests/test_db_access.py -v`
-Expected: FAIL，ImportError
+Expected: FAIL，ImportError: cannot import name 'EncryptedDb'
 
 - [ ] **Step 3: 实现 db_access.py**
 
 ```python
-"""SQLCipher 参数候选与只读访问。
+"""只读访问微信 4.x 消息库：纯 Python SQLCipher 解密（内存）→ stdlib sqlite3。
 
-对 Windows 微信 4.x：库文件已加密但具体参数未知，采用枚举验证法。
-注意本机 sqlcipher3-binary 可能不可用，兼容 pysqlcipher3 导入。
+解密后的明文只存在于内存（sqlite3.Connection.deserialize），不写盘。
 """
 
-from itertools import product
+import sqlite3
 from pathlib import Path
 
+from wechat_export import sqlcipher as sc
 from wechat_export.exceptions import DecryptError
-
-try:
-    import sqlcipher3 as _sqlite
-except ImportError:  # pragma: no cover
-    try:
-        import pysqlcipher3 as _sqlite
-    except ImportError as e:  # pragma: no cover
-        raise ImportError(
-            "缺少 SQLCipher 绑定：请安装 sqlcipher3-binary 或 pysqlcipher3-binary"
-        ) from e
-
-_SQLITE_HEADER = b"SQLite format 3\x00"
-
-_PAGE_SIZES = [4096, 1024, 2048, 8192, 512]
-_KDF_ITERS = [256000, 64000, 1]
-_HMACS = ["HMAC_SHA512", "HMAC_SHA1"]
-
-
-def _build_candidates() -> list[str]:
-    out = []
-    for page, kdf, hmac in product(_PAGE_SIZES, _KDF_ITERS, _HMACS):
-        out.append(
-            f"cipher_page_size={page};kdf_iter={kdf};cipher_hmac_algorithm={hmac}"
-        )
-    return out
-
-
-SQLCIPHER_PARAM_CANDIDATES = _build_candidates()
 
 
 def is_encrypted_db(db_path: Path) -> bool:
     with open(db_path, "rb") as fp:
-        head = fp.read(16)
-    return head != _SQLITE_HEADER
+        head = fp.read(32)
+    try:
+        sc.parse_header(head)
+    except sc.SqlcipherError:
+        return False
+    return True
 
 
 class EncryptedDb:
@@ -723,36 +789,25 @@ class EncryptedDb:
             raise DecryptError(f"数据库文件不存在：{db_path}")
         if not is_encrypted_db(db_path):
             raise DecryptError(
-                f"{db_path.name} 不是加密库（疑似明文 SQLite，或格式不受支持）",
+                f"{db_path.name} 不是 SQLCipher 加密库",
                 hint="请确认目标为微信 4.x 数据库",
             )
-        self._db_path = db_path
-        self._key_hex = key_hex
-        self.params = ""
-        self.conn = self._try_open()
-
-    def _try_open(self):
-        last_err = None
-        for params in SQLCIPHER_PARAM_CANDIDATES:
-            try:
-                conn = _sqlite.connect(f"file:{self._db_path}?mode=ro", uri=True)
-                conn.execute(f'PRAGMA key="x\'{self._key_hex}\'"')
-                for p in params.split(";"):
-                    conn.execute(f"PRAGMA {p}")
-                conn.execute("PRAGMA quick_check")  # 触发真实读取，参数错误会抛异常
-                conn.execute("SELECT COUNT(*) FROM sqlite_master")
-                self.params = params
-                return conn
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
-                try:
-                    conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
-        raise DecryptError(
-            f"无法解密数据库 {self._db_path.name}",
-            hint=f"密钥可能错误或参数不匹配。最后错误：{last_err}",
-        )
+        data = db_path.read_bytes()
+        try:
+            plain = sc.decrypt_db(data, key_hex)
+        except sc.SqlcipherError as e:
+            raise DecryptError(f"无法解密数据库 {db_path.name}",
+                               hint=str(e)) from e
+        if not plain.startswith(sc.SQLITE_MAGIC):
+            raise DecryptError(
+                f"无法解密数据库 {db_path.name}（密钥可能错误）",
+                hint="请确认密钥正确，或改用 --key-hex 手动提供",
+            )
+        page_size, reserved = sc.parse_header(data)
+        self.params = f"page_size={page_size};reserved={reserved}"
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.deserialize(plain)
+        self._plain = plain  # 保持引用，防止被 GC
 
     def tables(self) -> list[str]:
         rows = self.query(
@@ -782,19 +837,17 @@ def open_encrypted(db_path: Path, key_hex: str) -> EncryptedDb:
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `pytest tests/test_db_access.py -v`
+Run: `pytest tests/test_db_access.py tests/test_sqlcipher.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add wechat_export/db_access.py tests/test_db_access.py
-git commit -m "feat: SQLCipher 参数枚举与只读访问"
+git add tests/fixtures tests/conftest.py wechat_export/db_access.py tests/test_db_access.py
+git commit -m "feat: SQLCipher 只读访问（内存解密 + 合成夹具工厂）"
 ```
 
----
-
-### Task 6: 数据定位（locator.py）
+---### Task 6: 数据定位（locator.py）
 
 **Files:**
 - Create: `wechat_export/locator.py`
@@ -1037,8 +1090,7 @@ def test_parse_key_hex_good(good):
 
 def test_manual_key_provider(tmp_path):
     db = tmp_path / "m.db"
-    conn = f.create_encrypted_db(db, KEY, f.PARAM_SET_DEFAULT["pragmas"])
-    f.close(conn)
+    f.create_encrypted_db(db, KEY)
     kp = KeyProvider(db, manual_key=KEY)
     assert kp.get_key() == KEY
 
@@ -1049,8 +1101,7 @@ KEY_ENTROPY = bytes(range(32)).hex()
 
 def test_dump_candidates_found(tmp_path):
     db = tmp_path / "m.db"
-    conn = f.create_encrypted_db(db, KEY_ENTROPY, f.PARAM_SET_DEFAULT["pragmas"])
-    f.close(conn)
+    f.create_encrypted_db(db, KEY_ENTROPY)
     blob = b"junk" * 1000 + bytes.fromhex(KEY_ENTROPY) + b"tail" * 100
     found = extract_key_from_dump(blob, db)
     assert found == KEY_ENTROPY
@@ -1058,16 +1109,14 @@ def test_dump_candidates_found(tmp_path):
 
 def test_dump_candidates_not_found(tmp_path):
     db = tmp_path / "m.db"
-    conn = f.create_encrypted_db(db, KEY_ENTROPY, f.PARAM_SET_DEFAULT["pragmas"])
-    f.close(conn)
+    f.create_encrypted_db(db, KEY_ENTROPY)
     # 低熵明文无法通过高熵过滤，应快速返回 None
     assert extract_key_from_dump(b"no key here " * 50, db) is None
 
 
 def test_no_key_raises(tmp_path):
     db = tmp_path / "m.db"
-    conn = f.create_encrypted_db(db, KEY, f.PARAM_SET_DEFAULT["pragmas"])
-    f.close(conn)
+    f.create_encrypted_db(db, KEY)
     kp = KeyProvider(db, manual_key=None)
     with pytest.raises(KeyExtractError):
         kp.get_key()
@@ -1305,10 +1354,9 @@ def test_load_schema_with_snapshot():
 
 def test_snapshot_db(tmp_path):
     db = tmp_path / "m.db"
-    conn = f.create_encrypted_db(db, KEY, f.PARAM_SET_DEFAULT["pragmas"])
-    f.insert_message(conn, msg_id=1, ts=1, type_=1, content="x",
+    f.create_encrypted_db(db, KEY)
+    f.insert_message(db, key_hex=KEY, msg_id=1, ts=1, type_=1, content="x",
                      is_sender=0, talker="t")
-    f.close(conn)
     edb = open_encrypted(db, KEY)
     snap = snapshot_db(edb)
     edb.close()
@@ -2215,12 +2263,11 @@ def _make_env(tmp_path):
     root = tmp_path / "data" / "wxid_abc" / "db_storage" / "message"
     root.mkdir(parents=True)
     db = root / "message_0.db"
-    conn = f.create_encrypted_db(db, KEY, f.PARAM_SET_DEFAULT["pragmas"])
+    f.create_encrypted_db(db, KEY)
     for i in range(3):
-        f.insert_message(conn, msg_id=i + 1, ts=1700000000000 + i,
+        f.insert_message(db, key_hex=KEY, msg_id=i + 1, ts=1700000000000 + i,
                          type_=1, content=f"m{i}", is_sender=i % 2,
                          talker="wxid_b")
-    f.close(conn)
     return tmp_path
 
 
@@ -2529,7 +2576,7 @@ def test_summarize_counts():
 - [ ] **Step 2: 实现 tools/probe_wechat.py**
 
 ```python
-"""M0 探测脚本：本机实测 4.x 数据目录/密钥/SQLCipher 参数/schema。
+"""M0 探测脚本：本机实测 4.x 数据目录/密钥/SQLCipher 布局/schema。
 
 运行：python tools/probe_wechat.py --out docs/findings/4x-reverse-notes.md
 输出：结构化 JSON（stdout）+ 人类可读报告（--out）+ 更新 schema 快照。
@@ -2669,7 +2716,7 @@ python tools/probe_wechat.py --out docs/findings/4x-reverse-notes.md
 - 快照 `message_0.schema.json` 被真实列名覆盖
 - 若 `key_source == "memory"`，把实测到的密钥存放位置/方式记录进 `docs/findings/4x-reverse-notes.md`；若发现**本地落盘密钥**，把路径登记进 `key_provider.LOCAL_KEY_CANDIDATE_RELPATHS` 并补单测
 
-**失败则逐项排查**：数据根目录名（更新 `locator.DATA_DIR_NAMES`）→ db_storage 路径（更新 `locator.DB_STORAGE_NAMES`）→ 密钥（手动 `--key-hex` 验证，若密钥来自第三方 dump 工具）→ 参数集合（扩充 `db_access.SQLCIPHER_PARAM_CANDIDATES` 的 page/kdf/hmac 候选）。每项排查修正后补对应单测再继续。
+**失败则逐项排查**：数据根目录名（更新 `locator.DATA_DIR_NAMES`）→ db_storage 路径（更新 `locator.DB_STORAGE_NAMES`）→ 密钥（手动 `--key-hex` 验证，若密钥来自第三方 dump 工具）→ 头部/密钥形态（若 4.x 库不符合 raw-key 直用路径，在 `sqlcipher.py` 增加对应分支——以实测为准；页大小/保留区由头部直接读出，不需要枚举）。每项排查修正后补对应单测再继续。
 
 - [ ] **Step 5: 依据实测结果更新映射与媒体 resolver 接口**
 
@@ -2729,4 +2776,4 @@ git commit -m "docs: README 与交付说明"
 - **Spec 覆盖**：§3 架构→Task 1/5/6/13；§4 密钥三级+参数枚举→Task 5/7/14；§5 消息模型→Task 3/9；§6 导出规格→Task 10/11/12；§7 CLI 与错误码→Task 2/13；§8 测试→Task 4 及各任务 TDD 步骤；§9 里程碑 M0→Task 14，M1→5/6/7，M2→8/9，M3→10/11/12，M4→13/15。无缺口。
 - **占位符扫描**：媒体二进制解析（Task 9 注）、`LOCAL_KEY_CANDIDATE_RELPATHS` 空表、`_archive_media` 暂标记 missing——均为**留给 M0 实测填充的接口点**，探测脚本（Task 14）定义了填写的具体路径与步骤，非"实现 later"。
 - **类型一致性**：`Message/Media/Session/Contact` 字段、`EncryptedDb.query/tables/columns`、`MediaArchive.save_bytes/save_file`、`KeyProvider.get_key`、`write_session_messages` 等接口在任务间签名一致；`schema.SchemaInfo` 的字段名与 `DEFAULT_MAPPING` 键一致。
-- **评审修订记录（写入后 inline 修复）**：① cli 测试夹具用 `monkeypatch` 固定候选数据根，避免扫到开发机真实微信数据导致测试不确定；② 密钥格式校验提前到定位之前（错误码 1 优先级确定）；③ 内存扫描候选改为高熵过滤（≥16 不同字节），合成测试密钥改为 `bytes(range(32))`，低熵明文不触发解密尝试；④ `collect_dump_candidates` 去掉残留占位变量并限定候选上限；⑤ MiniDump 改用 `CreateFileW` 的 Win32 句柄（fd 不能直接用作 HANDLE）；⑥ cli 计数逻辑重构（`_archive_media` 返回 `(ok, missing)` 元组，report 统一累加）；⑦ probe 写快照时按候选列名推断语义映射，避免写入错误的列名映射。
+- **评审修订记录（写入后 inline 修复）**：① cli 测试夹具用 `monkeypatch` 固定候选数据根，避免扫到开发机真实微信数据导致测试不确定；② 密钥格式校验提前到定位之前（错误码 1 优先级确定）；③ 内存扫描候选改为高熵过滤（≥16 不同字节），合成测试密钥改为 `bytes(range(32))`，低熵明文不触发解密尝试；④ `collect_dump_candidates` 去掉残留占位变量并限定候选上限；⑤ MiniDump 改用 `CreateFileW` 的 Win32 句柄（fd 不能直接用作 HANDLE）；⑥ cli 计数逻辑重构（`_archive_media` 返回 `(ok, missing)` 元组，report 统一累加）；⑦ probe 写快照时按候选列名推断语义映射，避免写入错误的列名映射；⑧ **v2 解密方案重写**（经需求方确认）：sqlcipher3-binary 无 Windows 轮子、pysqlcipher3-binary 仅有 py3.8 轮（已核实 PyPI），改为纯 Python 逐页 AES-256-CBC 解密（Task 4 sqlcipher.py，路径已对照官方源码）；Task 5 夹具工厂改为"明文建库→加密"，db_access 改为内存 deserialize 读取；Task 1 依赖移除 sqlcipher3-binary。
