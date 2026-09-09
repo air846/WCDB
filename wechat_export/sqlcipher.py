@@ -13,7 +13,11 @@
   保留区=0、fraction 常量 0x40/0x20/0x20），而非被注入的魔数
 """
 
+import hashlib
+import hmac as hmac_mod
 import os
+import struct
+
 from Crypto.Cipher import AES
 
 SQLITE_MAGIC = b"SQLite format 3\x00"
@@ -22,7 +26,8 @@ KEY_SIZE = 32
 HEADER_SIZE = 16  # 页 1 明文 salt / 注入魔数区大小
 
 PAGE_SIZE_CANDIDATES = [4096, 1024, 2048, 8192, 512, 65536]
-RESERVED_CANDIDATES = [48, 16]  # 16(IV)+32(HMAC-SHA512) 或 16+20>36→48 取整；无 HMAC=16
+# M0 实测（微信 4.1.13.63）：reserved=80（IV 16 + HMAC-SHA512 64），4096×80 优先
+RESERVED_CANDIDATES = [80, 48, 16]
 
 
 class SqlcipherError(Exception):
@@ -72,25 +77,44 @@ def decrypt_db(data: bytes, key_hex: str, page_size: int, reserved: int) -> byte
 
 
 def encrypt_db(plain: bytes, key_hex: str, page_size: int = 4096,
-               reserved: int = 48) -> bytes:
-    """明文 SQLite 文件 → SQLCipher 加密文件（夹具库生成用）。"""
+               reserved: int = 80, salt: bytes | None = None) -> bytes:
+    """明文 SQLite 文件 → SQLCipher 加密文件（夹具库生成用）。
+
+    reserved >= 80 时按真实 SQLCipher 4 计算 HMAC-SHA512（便于 HMAC 校验测试）；
+    salt 可传入以保留原库 salt（重加密场景）。
+    """
     key = _parse_key(key_hex)
     if len(plain) % page_size != 0:
         raise SqlcipherError("明文大小不是页大小的整数倍")
     if reserved < IV_SIZE or (page_size - reserved) % 16 != 0:
         raise SqlcipherError("非法布局参数")
+    if salt is None:
+        salt = os.urandom(HEADER_SIZE)
+    if len(salt) != HEADER_SIZE:
+        raise SqlcipherError("salt 必须为 16 字节")
+    mac_key = None
+    if reserved >= IV_SIZE + 64:
+        mac_key = hashlib.pbkdf2_hmac(
+            "sha512", key, bytes(b ^ 0x3A for b in salt), 2, dklen=KEY_SIZE)
     out = bytearray()
     for off in range(0, len(plain), page_size):
         page = plain[off:off + page_size]
+        pgno = off // page_size + 1
         iv = os.urandom(IV_SIZE)
         if off == 0:
-            salt = os.urandom(HEADER_SIZE)
             ct = AES.new(key, AES.MODE_CBC, iv).encrypt(page[HEADER_SIZE:page_size - reserved])
             out += salt + ct
         else:
             ct = AES.new(key, AES.MODE_CBC, iv).encrypt(page[:page_size - reserved])
             out += ct
-        out += iv + os.urandom(reserved - IV_SIZE)
+        out += iv
+        if mac_key is not None:
+            tag = hmac_mod.new(
+                mac_key, ct + iv + struct.pack("<I", pgno), hashlib.sha512).digest()
+            out += tag[:64]
+            out += os.urandom(reserved - IV_SIZE - 64)
+        else:
+            out += os.urandom(reserved - IV_SIZE)
     return bytes(out)
 
 

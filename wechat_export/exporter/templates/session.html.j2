@@ -11,14 +11,15 @@
   <div style="max-width:70%;background:{{ 'var(--bubble-out)' if is_out else 'var(--bubble-in)' }};
               border:1px solid var(--border);border-radius:8px;padding:8px 12px">
     <div class="muted">{{ m.sender.name|e }}</div>
-    {% if m.media and m.media.status == "ok" and m.media.kind == "image" %}
+    {% set m_ok = m.media and m.media.status == "ok" %}
+    {% if m_ok and m.media.kind in ("image", "emoji") and m.media.ext not in (".dat",) %}
       <img src="{{ m.media.rel_path }}" onclick="zoom(this)" loading="lazy" alt="图片">
-    {% elif m.media and m.media.status == "ok" and m.media.kind == "video" %}
+    {% elif m_ok and m.media.kind == "video" %}
       <video src="{{ m.media.rel_path }}" controls preload="metadata"></video>
-    {% elif m.media and m.media.status == "ok" and m.media.kind == "voice" %}
+    {% elif m_ok and m.media.kind == "voice" %}
       <audio src="{{ m.media.rel_path }}" controls preload="metadata"></audio>
-    {% elif m.media and m.media.status == "ok" and m.media.kind == "file" %}
-      <a href="{{ m.media.rel_path }}">下载文件 {{ m.media.ext }}</a>
+    {% elif m_ok %}
+      <a href="{{ m.media.rel_path }}">下载 {{ m.media.kind }} {{ m.media.ext }}</a>
     {% elif m.raw %}
       <div class="muted">[{{ m.type_name }}] {{ m.content }}</div>
     {% else %}

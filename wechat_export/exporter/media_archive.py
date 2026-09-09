@@ -6,7 +6,7 @@ from pathlib import Path
 
 from wechat_export.message_model import Media
 
-KIND_DIRS = {"image": "image", "video": "video", "voice": "voice", "file": "file"}
+KIND_DIRS = {"image": "image", "video": "video", "voice": "voice", "file": "file", "emoji": "emoji"}
 
 
 def _md5_of_bytes(data: bytes) -> str:

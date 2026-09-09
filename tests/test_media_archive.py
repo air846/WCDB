@@ -22,7 +22,8 @@ def test_save_bytes_different_md5(tmp_path):
 
 
 def test_kind_dirs():
-    assert KIND_DIRS == {"image": "image", "video": "video", "voice": "voice", "file": "file"}
+    assert KIND_DIRS == {"image": "image", "video": "video", "voice": "voice",
+                        "file": "file", "emoji": "emoji"}
 
 
 def test_missing_source(tmp_path):

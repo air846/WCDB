@@ -5,53 +5,50 @@
 """
 
 import argparse
+import datetime
 import json
 import sys
 from pathlib import Path
 
 from wechat_export import db_access, locator
-from wechat_export.key_provider import (
-    KeyProvider, find_weixin_pid, mini_dump_process, parse_key_hex,
-)
+from wechat_export.key_provider import KeyProvider, parse_key_hex
 from wechat_export.schema import snapshot_db
 
-SNAP_PATH = Path(__file__).parent.parent / "wechat_export" / "schema_snapshots" / "message_0.schema.json"
-
-# 语义列 → 候选真实列名（按优先级取第一个存在于实测表结构中的名字）
-_COLUMN_CANDIDATES = {
-    "msg_id": ["id", "Id", "msgId", "localId", "MsgSvrID"],
-    "talker": ["talker", "Talker", "strTalker"],
-    "type": ["type", "Type"],
-    "subtype": ["subtype", "SubType"],
-    "content": ["content", "Content"],
-    "create_time": ["createTime", "CreateTime"],
-    "is_sender": ["isSender", "IsSender"],
-    "status": ["status", "Status"],
-}
+SNAP_PATH = (Path(__file__).parent.parent / "wechat_export" / "schema_snapshots"
+             / "message_0.schema.json")
 
 
 def _write_snapshot(first: dict) -> None:
-    """把首个解密成功的库的实测表结构写入 schema 快照（含语义列映射推断）。"""
+    """把首个解密成功的库的实测表结构写入 schema 快照。"""
     full = json.loads(first["schema"])
-    cols_by_table = full["columns"]
-    msg_tables = [t for t in full["tables"] if "message" in t]
-    table = msg_tables[0] if msg_tables else full["tables"][0]
-    real = set(cols_by_table.get(table, []))
-    mapping = {
-        k: next((c for c in cands if c in real), cands[0])
-        for k, cands in _COLUMN_CANDIDATES.items()
-    }
     SNAP_PATH.write_text(
-        json.dumps({"table": table, "columns": cols_by_table, **mapping},
-                   ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+        json.dumps({
+            "table_prefix": "Msg_",
+            "name2id_table": "Name2Id",
+            "columns": full["columns"],
+            "msg_id": "local_id",
+            "type": "local_type",
+            "sender_id": "real_sender_id",
+            "create_time": "create_time",
+            "content": "message_content",
+            "source": "source",
+            "content_ct": "WCDB_CT_message_content",
+            "source_ct": "WCDB_CT_source",
+            "status": "status",
+        }, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+
+
+def _keys_for(db_files, manual_key: str | None) -> dict[str, str]:
+    if manual_key:
+        key = parse_key_hex(manual_key)
+        return {f.read_bytes()[:16].hex(): key for f in db_files}
+    return KeyProvider(db_files).get_keys()
 
 
 def probe(data_dir: str | None, manual_key: str | None) -> dict:
     accounts = locator.locate_data(data_dir)
     result = {"accounts": []}
-    key = parse_key_hex(manual_key) if manual_key else None
     for acc in accounts:
         entry = {"wxid": acc.wxid, "root": str(acc.root),
                  "db_storage": str(acc.db_storage) if acc.db_storage else None,
@@ -59,13 +56,22 @@ def probe(data_dir: str | None, manual_key: str | None) -> dict:
         if not acc.db_storage:
             result["accounts"].append(entry)
             continue
-        for db in locator.message_db_files(acc.db_storage):
+        db_files = locator.message_db_files(acc.db_storage)
+        try:
+            keys = _keys_for(db_files, manual_key)
+        except Exception as exc:  # noqa: BLE001
+            entry["key_error"] = str(exc)
+            keys = {}
+        for db in db_files:
             rec = {"name": db.name, "size": db.stat().st_size,
-                   "decrypted": False, "params": None, "tables": 0, "key_source": None}
+                   "decrypted": False, "params": None, "tables": 0,
+                   "key_source": None}
             try:
-                kp = KeyProvider(db, manual_key=manual_key, account=acc)
-                k = kp.get_key()
-                edb = db_access.open_encrypted(db, k)
+                salt = db.read_bytes()[:16].hex()
+                key = keys.get(salt)
+                if not key:
+                    raise RuntimeError("该库密钥未提取到")
+                edb = db_access.open_encrypted(db, key)
                 snap = snapshot_db(edb)
                 params = edb.params
                 edb.close()
@@ -106,7 +112,7 @@ def main(argv=None) -> int:
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(
-            f"# 微信 4.x 逆向实测记录\n\n- 时间：{__import__('datetime').datetime.now()}\n"
+            f"# 微信 4.x 逆向实测记录\n\n- 时间：{datetime.datetime.now()}\n"
             f"- 解密：{s['decrypted_dbs']}/{s['total_dbs']}\n"
             f"- 参数：{first.get('params')}\n- 密钥来源：{first.get('key_source')}\n\n"
             f"```json\n{json.dumps(json.loads(first['schema']), ensure_ascii=False, indent=1)}\n```\n",

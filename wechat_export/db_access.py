@@ -37,10 +37,14 @@ class EncryptedDb:
             )
         page_size, reserved = layout
         self.params = f"page_size={page_size};reserved={reserved}"
-        plain = sc.decrypt_db(data, key_hex, page_size, reserved)
+        plain = bytearray(sc.decrypt_db(data, key_hex, page_size, reserved))
+        # M0 实测：真实库为 WAL 模式（头部版本字节 2/2），强制为 rollback 模式
+        # 才能用 :memory: + deserialize 只读打开（不写盘、不建 -wal/-shm）
+        plain[18] = 1
+        plain[19] = 1
         self.conn = sqlite3.connect(":memory:")
-        self.conn.deserialize(plain)
-        self._plain = plain  # 保持引用，防止被 GC
+        self.conn.deserialize(bytes(plain))
+        self._plain = bytes(plain)  # 保持引用，防止被 GC
 
     def tables(self) -> list[str]:
         rows = self.query(

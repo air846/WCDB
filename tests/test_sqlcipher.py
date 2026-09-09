@@ -7,7 +7,7 @@ from wechat_export import sqlcipher as sc
 KEY = "ab" * 32
 
 
-def _make_plain_sqlite(tmp_path, page_size=4096, reserved=48) -> bytes:
+def _make_plain_sqlite(tmp_path, page_size=4096, reserved=80) -> bytes:
     """生成带保留区的明文 SQLite 库。
 
     SQLCipher 页格式中每页末尾 reserved 字节存放 IV+HMAC，因此源明文库

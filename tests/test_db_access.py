@@ -11,17 +11,19 @@ KEY = f.KEY
 def encrypted_db(tmp_path):
     db = tmp_path / "message_0.db"
     f.create_encrypted_db(db, KEY)
-    f.insert_message(db, key_hex=KEY, msg_id=1, ts=1700000000000, type_=1,
-                     content="你好", is_sender=0, talker="wxid_b")
+    f.insert_message(db, key_hex=KEY, username="wxid_b", local_id=1,
+                     local_type=1, real_sender_id=1, create_time=1700000000,
+                     content="你好")
     return db
 
 
 def test_open_and_query(encrypted_db):
     edb = EncryptedDb(encrypted_db, KEY)
-    assert "message" in edb.tables()
-    rows = edb.query("SELECT content FROM message")
-    assert rows[0]["content"] == "你好"
+    assert f.session_table("wxid_b") in edb.tables()
+    rows = edb.query(f'SELECT message_content FROM "{f.session_table("wxid_b")}"')
+    assert rows[0]["message_content"] == "你好"
     assert "page_size=4096" in edb.params
+    assert "reserved=80" in edb.params
     edb.close()
 
 
@@ -32,7 +34,7 @@ def test_wrong_key_raises_decrypt_error(encrypted_db):
 
 def test_columns(encrypted_db):
     edb = open_encrypted(encrypted_db, KEY)
-    assert "content" in edb.columns("message")
+    assert "message_content" in edb.columns(f.session_table("wxid_b"))
     edb.close()
 
 

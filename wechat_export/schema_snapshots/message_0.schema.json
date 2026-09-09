@@ -1,14 +1,23 @@
 {
-  "table": "message",
+  "table_prefix": "Msg_",
+  "name2id_table": "Name2Id",
   "columns": {
-    "message": ["id", "talker", "type", "subtype", "content", "createTime", "isSender", "status"]
+    "Msg_<md5(session_username)>": [
+      "local_id", "server_id", "local_type", "sort_seq", "real_sender_id",
+      "create_time", "status", "upload_status", "download_status", "server_seq",
+      "origin_source", "source", "message_content", "compress_content",
+      "packed_info_data", "WCDB_CT_message_content", "WCDB_CT_source"
+    ],
+    "Name2Id": ["user_name", "is_session"],
+    "TimeStamp": ["timestamp"]
   },
-  "msg_id": "id",
-  "talker": "talker",
-  "type": "type",
-  "subtype": "subtype",
-  "content": "content",
-  "create_time": "createTime",
-  "is_sender": "isSender",
+  "msg_id": "local_id",
+  "type": "local_type",
+  "sender_id": "real_sender_id",
+  "create_time": "create_time",
+  "content": "message_content",
+  "source": "source",
+  "content_ct": "WCDB_CT_message_content",
+  "source_ct": "WCDB_CT_source",
   "status": "status"
 }

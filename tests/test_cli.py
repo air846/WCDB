@@ -1,8 +1,11 @@
+import json
+from pathlib import Path
+
 import pytest
 
-from wechat_export import cli
 from tests.fixtures import db_factory as f
-from pathlib import Path
+from wechat_export import cli
+from wechat_export.exceptions import KeyExtractError
 
 KEY = "a1" * 32
 
@@ -15,22 +18,32 @@ def _only_tmp_roots(monkeypatch):
 
 
 def _make_env(tmp_path):
-    """搭建：数据根(wxid_abc/db_storage/message/message_0.db 带 3 条消息) + 输出目录"""
-    root = tmp_path / "data" / "wxid_abc" / "db_storage" / "message"
-    root.mkdir(parents=True)
-    db = root / "message_0.db"
+    db_dir = tmp_path / "data" / "wxid_abc" / "db_storage" / "message"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "message_0.db"
     f.create_encrypted_db(db, KEY)
+    f.add_name(db, key_hex=KEY, rowid=1, user_name="wxid_b")
+    f.add_name(db, key_hex=KEY, rowid=2, user_name="wxid_abc")
+    f.add_session(db, key_hex=KEY, username="wxid_b")
     for i in range(3):
-        f.insert_message(db, key_hex=KEY, msg_id=i + 1, ts=1700000000000 + i,
-                         type_=1, content=f"m{i}", is_sender=i % 2,
-                         talker="wxid_b")
-    return tmp_path
+        f.insert_message(db, key_hex=KEY, username="wxid_b", local_id=i + 1,
+                         local_type=1, real_sender_id=1 + (i % 2),
+                         create_time=1700000000 + i, content=f"m{i}")
+    return tmp_path, db
+
+
+def _write_keys(tmp_path, keys: dict) -> Path:
+    path = tmp_path / "keys.json"
+    path.write_text(json.dumps(keys), encoding="utf-8")
+    return path
 
 
 def test_main_success(tmp_path):
-    env = _make_env(tmp_path)
+    env, db = _make_env(tmp_path)
+    salt = db.read_bytes()[:16].hex()
     code = cli.main([
-        "--data-dir", str(env / "data"), "--key-hex", KEY,
+        "--data-dir", str(env / "data"),
+        "--keys-file", str(_write_keys(env, {salt: KEY})),
         "--out", str(env / "out"), "--session", "wxid_b",
     ])
     assert code == 0
@@ -42,27 +55,59 @@ def test_main_success(tmp_path):
     assert "m1" in data
 
 
-def test_main_resume_skips_done(tmp_path):
-    env = _make_env(tmp_path)
+def test_main_key_hex(tmp_path):
+    env, _ = _make_env(tmp_path)
+    code = cli.main([
+        "--data-dir", str(env / "data"), "--key-hex", KEY,
+        "--out", str(env / "out"), "--session", "wxid_b",
+    ])
+    assert code == 0
+
+
+def test_main_resume_keeps_index(tmp_path):
+    env, db = _make_env(tmp_path)
     out = env / "out"
     (out / "wxid_b").mkdir(parents=True)
     (out / "wxid_b" / ".done").write_text("done")
+    (out / "wxid_b" / "session.json").write_text(json.dumps({
+        "id": "wxid_b", "name": "李四", "chat_type": "single",
+        "member_count": 0, "stats": {"messages": 7},
+    }), encoding="utf-8")
+    salt = db.read_bytes()[:16].hex()
     code = cli.main([
-        "--data-dir", str(env / "data"), "--key-hex", KEY,
+        "--data-dir", str(env / "data"),
+        "--keys-file", str(_write_keys(env, {salt: KEY})),
         "--out", str(out), "--session", "wxid_b", "--resume",
     ])
     assert code == 0
-    # 会话被跳过：.done 内容保持原样（未被重新写入）
     assert (out / "wxid_b" / ".done").read_text() == "done"
+    sessions = json.loads((out / "sessions.json").read_text(encoding="utf-8"))
+    assert [s["id"] for s in sessions["sessions"]] == ["wxid_b"]
+    assert sessions["counts"]["wxid_b"] == 7
 
 
 def test_main_bad_key_hex(tmp_path):
     code = cli.main(["--key-hex", "zz", "--out", str(tmp_path / "o")])
-    assert code == 1  # ConfigError：密钥格式在定位之前先校验
+    assert code == 1
 
 
 def test_main_missing_wechat(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
     code = cli.main(["--data-dir", str(empty), "--out", str(tmp_path / "o")])
-    assert code == 2  # WeChatNotFoundError
+    assert code == 2
+
+
+class _FailProvider:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def get_keys(self):
+        raise KeyExtractError("no key", hint="mock")
+
+
+def test_main_key_extract_failure(tmp_path, monkeypatch):
+    env, _ = _make_env(tmp_path)
+    monkeypatch.setattr(cli, "KeyProvider", _FailProvider)
+    code = cli.main(["--data-dir", str(env / "data"), "--out", str(env / "out")])
+    assert code == 3
