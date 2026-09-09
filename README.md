@@ -18,6 +18,9 @@
   zstd 压缩内容、组合类型 `(subtype<<32)|base_type`
 - 导出 HTML（气泡视图、按天分组、双主题、零 CDN）、JSON（分块 + `.done` 断点）、
   媒体（图片/视频/语音/表情按 md5 去重归档）
+- **图片解码**：微信 4.x 的 `V2 .dat`（AES-128-ECB + 单字节 XOR）自动解码为
+  `.jpg/.png/.gif/.webp`，旧版单字节 XOR `.dat` 同样兼容；图片密钥优先从
+  `Weixin.exe` 进程内存自动提取（也可 `--image-key` 手动提供）
 - `--resume` 断点续导
 
 ## 安装
@@ -43,7 +46,13 @@ wechat-export --out ./chat_export --wxid wxid_xxx --session wxid_yyy --session 1
 # 跳过媒体（只出文本/JSON）
 wechat-export --out ./chat_export --no-media
 
-# 断点续导（跳过已完成的会话）
+# 手动提供图片密钥（32位hex 或 16位ASCII；不传则自动从进程内存提取）
+wechat-export --out ./chat_export --image-key <32位hex>
+
+# 图片密钥自动提取失败时，可深度扫描进程内存（较慢）
+wechat-export --out ./chat_export --image-key-scan deep
+
+# 断点续导（跳过已完成的会话；若已拿到图片密钥，会自动重导含未解码图片的会话）
 wechat-export --out ./chat_export --resume
 
 # 手动提供密钥（单密钥或 JSON 映射）
@@ -69,6 +78,9 @@ wechat-export --out ./chat_export --keys-file keys.json
     └── media/
         ├── image/  video/  voice/  file/  emoji/
 ```
+
+> `messages.json` / HTML 中的 `media.rel_path` 均以会话目录为根（如
+> `media/image/<md5>.jpg`），可直接相对引用。
 
 ## 错误码
 
@@ -106,14 +118,22 @@ wechat-export --out ./chat_export --keys-file keys.json
 ## 已知限制
 
 - 仅实测微信 4.1.13.63；其他 4.x 小版本的 codec 结构/pad 可能不同（脚本会明确报错）
-- 图片/表情的 `.dat` 为微信自有编码，当前**原样归档**（未转码为浏览器可渲染格式）
+- **图片密钥**：微信仅在解码图片时把 16 字节 AES 密钥加载进内存，因此自动提取前
+  需先在微信里**点开任意一张聊天图片**；否则请用 `--image-key` 手动提供
+- 图片格式为 `wxgf`（微信自有 HEVC 容器）时仅原样归档，浏览器无法直接渲染
 - 视频/文件类媒体仅能归档已下载到本机的文件；未下载的标记 `missing`
 - 语音以 `.silk` 原样归档
 - 群成员显示名/头像等更丰富的联系人信息可后续增强
 
 ## 常见问题
 
+- **图片加载不出来**：① 确认 HTML 用浏览器直接打开且 `media/` 目录与 `index.html`
+  同级；② 若 `media/image/` 下仍是 `.dat`，说明导出时没有图片密钥——先在微信里点开
+  一张图片，再 `wechat-export --out ./chat_export --resume`（会自动重导未解码会话），
+  或 `--image-key` 手动提供；③ `.wxgf` 是微信自有格式，需转码后才能预览
 - **找不到数据目录**：用 `--data-dir` 指定数据根（`...\xwechat_files`）
 - **密钥提取失败**：确认微信已登录并保持运行；或 `--key-hex` / `--keys-file` 手动提供
+- **图片密钥提取失败**：先在微信中打开一张聊天图片（点开大图）再重试，或加
+  `--image-key-scan deep` 深度扫描，或 `--image-key` 手动提供
 - **权限不足**：以管理员身份运行（读取进程内存）
 - **磁盘空间**：媒体可能很大（实测某账号 `msg` 目录 14GB），可用 `--no-media` 或 `--session` 控制

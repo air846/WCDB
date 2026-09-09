@@ -86,6 +86,36 @@ def test_main_resume_keeps_index(tmp_path):
     assert sessions["counts"]["wxid_b"] == 7
 
 
+def test_has_undecoded_media(tmp_path):
+    out = tmp_path / "s"
+    assert cli._has_undecoded_media(out) is False
+    (out / "media" / "image").mkdir(parents=True)
+    (out / "media" / "image" / "a.dat").write_bytes(b"x")
+    assert cli._has_undecoded_media(out) is True
+
+
+def test_resume_reprocesses_when_image_key_available(tmp_path):
+    env, db = _make_env(tmp_path)
+    out = env / "out"
+    sdir = out / "wxid_b"
+    (sdir / "media" / "image").mkdir(parents=True)
+    (sdir / "media" / "image" / "a.dat").write_bytes(b"x")
+    (sdir / ".done").write_text("done")
+    (sdir / "session.json").write_text(json.dumps({
+        "id": "wxid_b", "name": "李四", "chat_type": "single",
+        "member_count": 0, "stats": {"messages": 7},
+    }), encoding="utf-8")
+    salt = db.read_bytes()[:16].hex()
+    code = cli.main([
+        "--data-dir", str(env / "data"),
+        "--keys-file", str(_write_keys(env, {salt: KEY})),
+        "--out", str(out), "--session", "wxid_b", "--resume",
+        "--image-key", "ab" * 16,
+    ])
+    assert code == 0
+    assert "m1" in (sdir / "messages.json").read_text(encoding="utf-8")
+
+
 def test_main_bad_key_hex(tmp_path):
     code = cli.main(["--key-hex", "zz", "--out", str(tmp_path / "o")])
     assert code == 1

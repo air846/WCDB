@@ -10,7 +10,7 @@ from pathlib import Path
 
 from wechat_export import db_access, locator
 from wechat_export.exceptions import (
-    ExportError, PartialExportError, WeChatNotFoundError, format_error,
+    ConfigError, ExportError, PartialExportError, WeChatNotFoundError, format_error,
 )
 from wechat_export.exporter.html_renderer import HtmlRenderer
 from wechat_export.exporter.json_writer import (
@@ -18,6 +18,7 @@ from wechat_export.exporter.json_writer import (
     write_sessions_index,
 )
 from wechat_export.exporter.media_archive import MediaArchive, placeholder_media
+from wechat_export.image_decoder import decode_dat, decode_raw_aes, global_xor_key
 from wechat_export.key_provider import KeyProvider, parse_key_hex
 from wechat_export.message_model import Media, Message, Session
 from wechat_export.parser import parse_message_row
@@ -56,7 +57,9 @@ class ExportReport:
     media_ok: int = 0
     media_missing: int = 0
     skipped: int = 0
+    media_decoded: int = 0
     errors: list[str] = field(default_factory=list)
+    image_key_note: str = ""
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -71,6 +74,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="会话白名单（会话 username，可重复）")
     p.add_argument("--key-hex", help="手动提供密钥（所有库共用一个，hex）")
     p.add_argument("--keys-file", help="密钥文件（JSON：{salt_hex: key_hex}）")
+    p.add_argument("--image-key", help="图片 AES 密钥（32位hex 或 16位ASCII）")
+    p.add_argument("--image-key-scan", choices=["fast", "deep", "off"], default="fast",
+                   help="图片密钥提取方式（默认 fast；未找到时可试 deep）")
     p.add_argument("--no-media", action="store_true", help="跳过媒体归档")
     p.add_argument("--resume", action="store_true", help="跳过已完成会话（.done 标记）")
     return p.parse_args(argv)
@@ -103,6 +109,61 @@ def _load_keys(args, db_files: list[Path]) -> dict[str, str]:
         data = json.loads(Path(args.keys_file).read_text(encoding="utf-8"))
         return _normalize_keys(data)
     return KeyProvider(db_files).get_keys()
+
+
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+
+def parse_image_key(s: str) -> bytes:
+    """解析图片 AES 密钥：32 位 hex 或 16/24/32 位 ASCII。"""
+    s = s.strip()
+    if s.lower().startswith("0x"):
+        s = s[2:]
+    if len(s) == 32 and _HEX_RE.match(s):
+        return bytes.fromhex(s)
+    raw = s.encode("utf-8")
+    if len(raw) in (16, 24, 32):
+        return raw
+    raise ConfigError(
+        "图片密钥格式错误：需要 32 位 16 进制或 16/24/32 位 ASCII",
+        hint="示例：--image-key 0123456789abcdef0123456789abcdef",
+    )
+
+
+def _image_samples(account_root: Path, limit: int = 400) -> list[Path]:
+    attach = Path(account_root) / "msg" / "attach"
+    if not attach.is_dir():
+        return []
+    try:
+        paths = sorted(attach.glob("*/*/Img/*.dat"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    return paths[:limit]
+
+
+def _load_image_key(args, samples: list[Path]) -> bytes | None:
+    if args.image_key:
+        return parse_image_key(args.image_key)
+    if args.image_key_scan == "off" or not samples:
+        return None
+    from wechat_export.image_key import extract_image_key
+    try:
+        return extract_image_key(samples, deep=(args.image_key_scan == "deep"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _tail_samples(paths, limit: int = 64) -> list[bytes]:
+    tails = []
+    for path in paths[:limit]:
+        try:
+            with open(path, "rb") as fp:
+                fp.seek(-4, 2)
+                tails.append(fp.read())
+        except OSError:
+            continue
+    return tails
 
 
 def _load_snapshot() -> dict | None:
@@ -169,11 +230,15 @@ def _load_voice_index(db_storage: Path, keys: dict[str, str]) -> tuple[dict, dic
 
 class MediaResolver:
     def __init__(self, account_root: Path, archive: MediaArchive,
-                 voice_index: dict, username_to_name2id: dict):
+                 voice_index: dict, username_to_name2id: dict,
+                 image_key: bytes | None = None, xor_key: int | None = None):
         self.account_root = account_root
         self.archive = archive
         self.voice_index = voice_index
         self.username_to_name2id = username_to_name2id
+        self.image_key = image_key
+        self.xor_key = xor_key
+        self.decoded = 0
         self._index: dict[str, Path] | None = None
 
     def _session_index(self, username: str) -> dict[str, Path]:
@@ -194,6 +259,22 @@ class MediaResolver:
         self._index = index
         return index
 
+    def _archive_image(self, src: Path, kind: str, md5: str,
+                       fallback_ext: str, try_raw_aes: bool = False) -> Media:
+        """尝试解码 `.dat`/加密表情；失败则原样归档（保持旧行为）。"""
+        try:
+            data = src.read_bytes()
+        except OSError:
+            return placeholder_media(Media(kind=kind, md5=md5))
+        decoded = decode_dat(data, self.image_key, self.xor_key)
+        if decoded is None and try_raw_aes:
+            decoded = decode_raw_aes(data, self.image_key)
+        if decoded is not None:
+            plain, ext, _renderable = decoded
+            self.decoded += 1
+            return self.archive.save_bytes(plain, kind, ext, md5=md5)
+        return self.archive.save_bytes(data, kind, fallback_ext, md5=md5)
+
     def resolve(self, media: Media, username: str, local_id: int) -> Media:
         if media.status != "ok":
             return media
@@ -208,11 +289,12 @@ class MediaResolver:
             base = self.account_root / "business" / "emoticon"
             persist = base / "Persist" / media.md5[:2] / media.md5
             if persist.exists():
-                return self.archive.save_file(persist, "emoji",
-                                              persist.suffix or ".bin", md5=media.md5)
+                return self._archive_image(persist, "emoji", media.md5,
+                                           persist.suffix or ".bin", try_raw_aes=True)
             thumb = base / "Thumb" / media.md5[:2] / (media.md5 + ".thumb")
             if thumb.exists():
-                return self.archive.save_file(thumb, "emoji", ".thumb", md5=media.md5)
+                return self._archive_image(thumb, "emoji", media.md5,
+                                           ".thumb", try_raw_aes=True)
             return placeholder_media(media)
         if not media.md5:
             return placeholder_media(media)
@@ -221,8 +303,8 @@ class MediaResolver:
                or index.get(media.md5 + "_t"))
         if src is None:
             return placeholder_media(media)
-        return self.archive.save_file(src, media.kind, src.suffix or media.ext,
-                                      md5=media.md5)
+        return self._archive_image(src, media.kind, media.md5,
+                                   src.suffix or media.ext)
 
 
 def _archive_media(msgs: list[Message], resolver: MediaResolver,
@@ -246,6 +328,16 @@ def _make_session(username: str, contacts: dict[str, str]) -> Session:
     is_group = username.endswith("@chatroom")
     return Session(id=username, name=contacts.get(username, username),
                    chat_type="group" if is_group else "single")
+
+
+def _has_undecoded_media(out_dir: Path) -> bool:
+    media = out_dir / "media"
+    if not media.is_dir():
+        return False
+    for pattern in ("*.dat", "*.bin", "*.thumb"):
+        if any(media.rglob(pattern)):
+            return True
+    return False
 
 
 def _resume_session(out_dir: Path) -> Session | None:
@@ -312,6 +404,20 @@ def run_export(args: argparse.Namespace) -> ExportReport:
     schema = load_schema(_load_snapshot())
     renderer = HtmlRenderer()
     account_root = account.db_storage.parent
+    image_key = None
+    xor_key = None
+    if not args.no_media:
+        samples = _image_samples(account_root)
+        image_key = _load_image_key(args, samples)
+        if samples:
+            xor_key = global_xor_key(_tail_samples(samples))
+            if image_key is None and args.image_key_scan != "off":
+                report.image_key_note = (
+                    "未找到图片 AES 密钥，图片暂以 .dat 原样归档。"
+                    "请在微信中打开任意一张聊天图片（点开大图）后重试："
+                    "微信仅在解码图片时把密钥加载到内存；"
+                    "重跑可加 --resume（会自动重导未解码的会话），"
+                    "或用 --image-key 手动提供（必要时加 --image-key-scan deep）。")
     done_sessions: list[Session] = []
     counts: dict[str, int] = {}
 
@@ -340,7 +446,10 @@ def run_export(args: argparse.Namespace) -> ExportReport:
             if wanted and username not in wanted:
                 continue
             out_dir = out_root / _safe_session_dir(username)
-            if args.resume and (out_dir / ".done").exists():
+            skip = args.resume and (out_dir / ".done").exists()
+            if skip and image_key and _has_undecoded_media(out_dir):
+                skip = False  # 已有图片密钥，重新导出以解码媒体
+            if skip:
                 report.skipped += 1
                 session = _resume_session(out_dir) or _make_session(username, contacts)
                 done_sessions.append(session)
@@ -364,8 +473,11 @@ def run_export(args: argparse.Namespace) -> ExportReport:
             ok = miss = 0
             if not args.no_media:
                 archive = MediaArchive(out_dir / "media")
-                resolver = MediaResolver(account_root, archive, voice_index, media_name2id)
+                resolver = MediaResolver(account_root, archive, voice_index,
+                                         media_name2id, image_key=image_key,
+                                         xor_key=xor_key)
                 ok, miss = _archive_media(msgs, resolver, username)
+                report.media_decoded += resolver.decoded
             session = _make_session(username, contacts)
             write_session_messages(out_dir, session, msgs)
             write_session_json(out_dir, session,
@@ -386,7 +498,8 @@ def run_export(args: argparse.Namespace) -> ExportReport:
         "account": account.wxid,
         "stats": {"sessions": report.sessions_done,
                   "messages": report.messages,
-                  "media": {"ok": report.media_ok, "missing": report.media_missing},
+                  "media": {"ok": report.media_ok, "missing": report.media_missing,
+                            "decoded": report.media_decoded},
                   "skipped": report.skipped},
     })
     write_sessions_index(out_root, done_sessions, counts)
@@ -406,8 +519,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         report = run_export(args)
         print(f"导出完成：会话 {report.sessions_done} 个，消息 {report.messages} 条，"
-              f"媒体成功 {report.media_ok} / 缺失 {report.media_missing}，"
-              f"跳过 {report.skipped} 个")
+              f"媒体成功 {report.media_ok} / 缺失 {report.media_missing}"
+              f"（其中解码 {report.media_decoded}），跳过 {report.skipped} 个")
+        if report.image_key_note:
+            print(f"提示：{report.image_key_note}", file=sys.stderr)
         print(f"输出目录：{Path(args.out).resolve()}")
         return 0
     except ExportError as e:
