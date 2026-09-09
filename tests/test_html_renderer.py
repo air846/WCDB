@@ -38,6 +38,19 @@ def test_render_index_and_session(tmp_path):
     assert '<audio' in html
 
 
+def test_render_session_escapes_user_content(tmp_path):
+    out = tmp_path / "s"
+    msgs = [_msg(1, 1700000000000, 10000,
+                 '<img src="SystemMessages_HongbaoIcon.png"/><script>alert(1)</script>')]
+    HtmlRenderer().render_session(out, Session(id="s", name="<b>S</b>"), msgs,
+                                  {"messages": 1})
+    html = (out / "index.html").read_text(encoding="utf-8")
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    assert "<img src=\"SystemMessages" not in html
+    assert "&lt;b&gt;S&lt;/b&gt;" in html
+
+
 def test_render_session_pagination(tmp_path, monkeypatch):
     monkeypatch.setattr("wechat_export.exporter.html_renderer.PAGE_SIZE", 2)
     renderer = HtmlRenderer()

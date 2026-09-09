@@ -6,7 +6,7 @@
 import datetime
 from pathlib import Path
 
-from jinja2 import Environment, FileSystemLoader, select_autoescape
+from jinja2 import Environment, FileSystemLoader
 
 from wechat_export.message_model import Media, Message, Session
 
@@ -29,7 +29,7 @@ def _fmt_day(ts: int) -> str:
 def _env(templates_dir: Path | None) -> Environment:
     return Environment(
         loader=FileSystemLoader(templates_dir or TEMPLATES_DIR),
-        autoescape=select_autoescape(["html"]),
+        autoescape=True,  # 模板扩展名为 .j2，select_autoescape 不会命中
     )
 
 
