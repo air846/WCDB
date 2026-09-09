@@ -10,3 +10,6 @@ chat_export/
 ### JetBrains ###
 .idea/
 *.iml
+# 运行时产物
+image_key.txt
+watch_image_key.log
