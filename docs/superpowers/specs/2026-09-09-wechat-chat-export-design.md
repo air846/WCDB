@@ -109,29 +109,41 @@ D:/code/WCDB/
 
 ## 4. 4.x 逆向与解密设计
 
-### 已知事实
+> **M0 实测修订（2026-09-09，微信 4.1.13.63）**：本节已按实测更新，
+> 完整证据见 `docs/findings/4x-reverse-notes.md`。
 
-- 数据目录：`文档\WeChat Files\<wxid>\db_storage\`
+### 已知事实（实测）
+
+- 数据根可为自定义路径，父目录明文存于 `%APPDATA%\Tencent\xwechat\config\*.ini`，
+  实际为 `<该目录>\xwechat_files\<wxid>\`
 - 消息库按分片存储：`db_storage\message\message_0.db`、`message_1.db`…
-- 联系人/会话信息位于 `contact.db`、`session.db` 等附属库（文件名待 M0 实测确认）
-- 加密为 SQLCipher（参数与 3.x 不同，待实测）
+- 每个 `.db` 有**独立 salt 与独立 enc_key**
+- 加密：SQLCipher 4 / AES-256-CBC / page=4096 / **reserve=80**（IV 16 + HMAC 64）/ HMAC-SHA512
+- 联系人/会话信息位于 `contact.db`、`session.db`、`media_0.db`、`message_resource.db` 等
 
-### 密钥提取三级策略
+### 密钥提取策略（实测三级）
 
 ```
-1. 本地落盘密钥   — 若 4.x 将密钥存于本机文件/注册表（M0 实测确认位置）
-2. 进程内存提取   — 对运行中的 Weixin.exe 做 MiniDump，扫描 32 字节密钥
-3. 手动输入兜底   — 用户提供 32 字节 hex key 时直接录入（--key-hex 参数）
+1. 进程内存提取   — 扫描运行中的 Weixin.exe 的 SQLCipher codec 上下文（首选，自动）
+2. 手动输入兜底   — --key-hex（单密钥）或 --keys-file（salt→key JSON）
+3. 本地落盘密钥   — 未发现可用的本地落盘密钥（4.1.13 未采用）
 ```
 
-### SQLCipher 读取路径（已按官方源码核实）
+内存提取要点：codec 上下文特征前缀定位 → 解析 `salt_ptr`/cipher ctx 指针 →
+keyspec 明文 `x'<64hex enc_key><32hex salt>'`；4.1.13 起 keyspec/key/hmac 以
+**32 字节重复 XOR pad** 混淆，pad 由 codec 内 salt 运行时推导（无需硬编码）。
+提取结果用 SQLCipher HMAC-SHA512 对页 1 校验。
 
-- 原始 32 字节密钥（`x'...'`）**直接作为 AES-256-CBC 密钥**，不经过 PBKDF2（raw key 分支）
-- 每页 IV = 该页保留区前 16 字节（明文存储）；解密仅需逐页 AES 解密，**不验证 HMAC**（仅完整性用途）
-- 页 1 布局（对照源码 sqlite3Codec 核实）：文件[0:16]=明文随机 salt（非魔数），加密区=[16, 页大小-保留区)，解密时魔数常量注入输出；其他页加密区=[0, 页大小-保留区)
-- 页大小/保留区在文件头**不可读**（源码注释："sqlite can't effectively determine the pagesize"），采用候选布局枚举（4096×48 优先，扩展 1024/2048/8192/512/65536 × 48/16）+ 解密后页 1 头部特征校验（页大小字段/版本字节/保留区=0/fraction 常量）探测
-- 解密后的明文 SQLite 只存在于内存（stdlib `sqlite3.Connection.deserialize`），不写盘；输出页长与输入一致（数据区解密 + 保留区透传），头部保留区字节 20 = reserved
-- M0 实测确认 4.x 库符合此路径；若实测偏离（如非 raw key），按实测在 `sqlcipher.py` 增加分支并更新本 spec
+### SQLCipher 读取路径（实测确认）
+
+- 每个库的 `enc_key`（32B）**直接作为 AES-256-CBC 密钥**（raw key，无 PBKDF2）
+- 页 1：`file[0:16]`=明文随机 salt，加密区 `[16, 页大小-80)`，
+  IV=`page[P-80:P-64]`，HMAC=`page[P-64:P]`；其他页加密区 `[0, 页大小-80)`
+- 布局探测：候选 (page_size, reserved) + 解密后页 1 头部特征校验；
+  **4096×80 优先**（实测值），兼容 48/16
+- 解密后的明文 SQLite 只存在于内存（`sqlite3.Connection.deserialize`），不写盘；
+  读入 `:memory:` 前把头部版本字节改为 rollback 模式（真实库为 WAL）
+- HMAC 校验公式：`HMAC-SHA512(PBKDF2-SHA512(enc_key, salt^0x3A, 2), page1[16:4032]+LE32(pgno))`
 
 ### 读写安全
 
