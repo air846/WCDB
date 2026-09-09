@@ -130,7 +130,7 @@ D:/code/WCDB/
 - 每页 IV = 该页保留区前 16 字节（明文存储）；解密仅需逐页 AES 解密，**不验证 HMAC**（仅完整性用途）
 - 页 1 布局（对照源码 sqlite3Codec 核实）：文件[0:16]=明文随机 salt（非魔数），加密区=[16, 页大小-保留区)，解密时魔数常量注入输出；其他页加密区=[0, 页大小-保留区)
 - 页大小/保留区在文件头**不可读**（源码注释："sqlite can't effectively determine the pagesize"），采用候选布局枚举（4096×48 优先，扩展 1024/2048/8192/512/65536 × 48/16）+ 解密后页 1 头部特征校验（页大小字段/版本字节/保留区=0/fraction 常量）探测
-- 解密后的明文 SQLite 只存在于内存（stdlib `sqlite3.Connection.deserialize`），不写盘，头部保留区字节清零
+- 解密后的明文 SQLite 只存在于内存（stdlib `sqlite3.Connection.deserialize`），不写盘；输出页长与输入一致（数据区解密 + 保留区透传），头部保留区字节 20 = reserved
 - M0 实测确认 4.x 库符合此路径；若实测偏离（如非 raw key），按实测在 `sqlcipher.py` 增加分支并更新本 spec
 
 ### 读写安全

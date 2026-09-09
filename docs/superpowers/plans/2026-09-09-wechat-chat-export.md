@@ -457,7 +457,7 @@ git commit -m "feat: 统一消息模型"
   - `SQLITE_MAGIC = b"SQLite format 3\x00"`、`IV_SIZE = 16`、`KEY_SIZE = 32`
   - `PAGE_SIZE_CANDIDATES = [4096, 1024, 2048, 8192, 512, 65536]`、`RESERVED_CANDIDATES = [48, 16]`（页 1 布局：文件[0:16]=随机 salt 明文；页 1 加密区=[16, P-R)；其他页=[0, P-R)；保留区=IV 16B + HMAC 取整到 16 倍数，即 48/16）
   - `def is_plaintext_sqlite(data: bytes) -> bool`：`data[:16] == SQLITE_MAGIC and data[20] == 0`
-  - `def decrypt_db(data: bytes, key_hex: str, page_size: int, reserved: int) -> bytes`：逐页 AES-256-CBC 解密；页 1 输出 = `SQLITE_MAGIC` 注入 + 解密区（SQLCipher 在解密时用常量替换 salt 区）；输出头部字节 20 清零
+  - `def decrypt_db(data: bytes, key_hex: str, page_size: int, reserved: int) -> bytes`：逐页 AES-256-CBC 解密；页 1 输出 = `SQLITE_MAGIC` 注入 + 解密区（SQLCipher 在解密时用常量替换 salt 区）；**输出页长与输入一致**：每页 = 解密数据区 + 原保留区字节回填（IV/HMAC 作为保留区透传），输出头部字节 20 = reserved（与页布局自洽）
   - `def encrypt_db(plain: bytes, key_hex: str, page_size: int = 4096, reserved: int = 48) -> bytes`：逆操作（夹具生成用；页 1 写入随机 salt，加密 [16, P-R)）
   - `def page1_header_ok(plain_page1: bytes, page_size: int) -> bool`：解密后页 1 头部特征校验（见下），用于布局枚举与错误密钥检测
   - `def find_layout(data: bytes, key_hex: str) -> tuple[int, int] | None`：按 `(PAGE_SIZE_CANDIDATES × RESERVED_CANDIDATES)` 顺序（4096×48 优先）尝试解密页 1 并做 `page1_header_ok`，返回首个通过的 (page_size, reserved)；全失败返回 None
@@ -523,6 +523,12 @@ def test_plain_sqlite_detected(tmp_path):
     plain = _make_plain_sqlite(tmp_path)
     assert sc.is_plaintext_sqlite(plain)
     assert sc.find_layout(plain, KEY) is None  # 无保留区，无合法布局
+
+
+def test_empty_input_handled():
+    assert sc.find_layout(b"", KEY) is None
+    with pytest.raises(sc.SqlcipherError):
+        sc.decrypt_db(b"", KEY, 4096, 48)
 
 
 def test_bad_key_length_raises(tmp_path):
@@ -736,9 +742,10 @@ def create_encrypted_db(path: Path, key_hex: str = KEY,
     conn.execute(f"CREATE TABLE message ({cols})")
     conn.commit()
     conn.close()
-    plain = plain_path.read_bytes()
+    plain = bytearray(plain_path.read_bytes())
+    plain[20] = reserved  # 镜像真实 SQLCipher 建库：头部保留区字节=reserved（页含保留区）
     plain_path.unlink()
-    path.write_bytes(sc.encrypt_db(plain, key_hex, page_size, reserved))
+    path.write_bytes(sc.encrypt_db(bytes(plain), key_hex, page_size, reserved))
 
 
 def insert_message(db_path: Path, *, key_hex: str = KEY, msg_id: int, ts: int,
@@ -2837,3 +2844,4 @@ git commit -m "docs: README 与交付说明"
 - **类型一致性**：`Message/Media/Session/Contact` 字段、`EncryptedDb.query/tables/columns`、`MediaArchive.save_bytes/save_file`、`KeyProvider.get_key`、`write_session_messages` 等接口在任务间签名一致；`schema.SchemaInfo` 的字段名与 `DEFAULT_MAPPING` 键一致。
 - **评审修订记录（写入后 inline 修复）**：① cli 测试夹具用 `monkeypatch` 固定候选数据根，避免扫到开发机真实微信数据导致测试不确定；② 密钥格式校验提前到定位之前（错误码 1 优先级确定）；③ 内存扫描候选改为高熵过滤（≥16 不同字节），合成测试密钥改为 `bytes(range(32))`，低熵明文不触发解密尝试；④ `collect_dump_candidates` 去掉残留占位变量并限定候选上限；⑤ MiniDump 改用 `CreateFileW` 的 Win32 句柄（fd 不能直接用作 HANDLE）；⑥ cli 计数逻辑重构（`_archive_media` 返回 `(ok, missing)` 元组，report 统一累加）；⑦ probe 写快照时按候选列名推断语义映射，避免写入错误的列名映射；⑧ **v2 解密方案重写**（经需求方确认）：sqlcipher3-binary 无 Windows 轮子、pysqlcipher3-binary 仅有 py3.8 轮（已核实 PyPI），改为纯 Python 逐页 AES-256-CBC 解密（Task 4 sqlcipher.py，路径已对照官方源码）；Task 5 夹具工厂改为"明文建库→加密"，db_access 改为内存 deserialize 读取；Task 1 依赖移除 sqlcipher3-binary。
 - **评审修订记录⑨（页 1 布局实证修正）**：实现轮发现并对照源码定案——SQLCipher 页 1 的[0:16]是明文随机 salt（非魔数），加密区=[16, P-R)，解密时魔数常量注入；页大小/保留区在文件头**不可读**（源码注释），改为候选布局枚举（4096×48 优先）+ 解密后页 1 头部特征校验（页大小字段/版本字节/保留区=0/fraction 常量 0x40 0x20 0x20）。新接口 `find_layout`/`page1_header_ok`。
+- **Ruling 10（byte20 修正裁定）**：审查实测证明 brief 原版"清零+丢保留区"产出 malformed 库——页 1 头 byte20 改为 reserved、保留区随页回填（输出页长与输入一致），此为该布局下唯一自洽解；is_plaintext_sqlite 接受 byte20∈{0,16,48}；Task 5 工厂同步（建库后置 byte20=reserved 再加密）。界面之外无用户可见差异。
