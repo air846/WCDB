@@ -120,10 +120,19 @@ include = ["wechat_export*"]
 testpaths = ["tests"]
 ```
 
-- [ ] **Step 3: 写 `wechat_export/__init__.py`**
+- [ ] **Step 3: 写 `wechat_export/__init__.py` 与 `cli.py` 占位**
+
+`wechat_export/__init__.py`：
 
 ```python
 __version__ = "0.1.0"
+```
+
+`cli.py` 占位实现（保证 `pip install -e .` 的 console script 入口可解析；Task 13 会用真实实现整体替换）：
+
+```python
+def main(argv=None) -> int:
+    return 0
 ```
 
 - [ ] **Step 4: 写 `.gitignore`**
@@ -2625,7 +2634,9 @@ def main(argv=None) -> int:
         first = next(db for a in res["accounts"]
                      for db in a["db_files"] if db.get("decrypted"))
         _write_snapshot(first)
-        Path(args.out).write_text(
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
             f"# 微信 4.x 逆向实测记录\n\n- 时间：{__import__('datetime').datetime.now()}\n"
             f"- 解密：{s['decrypted_dbs']}/{s['total_dbs']}\n"
             f"- 参数：{first.get('params')}\n- 密钥来源：{first.get('key_source')}\n\n"
