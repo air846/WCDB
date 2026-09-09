@@ -36,3 +36,17 @@ def test_render_index_and_session(tmp_path):
     html = (out / "index.html").read_text(encoding="utf-8")
     assert "media/image/a.jpg" in html
     assert '<audio' in html
+
+
+def test_render_session_pagination(tmp_path, monkeypatch):
+    monkeypatch.setattr("wechat_export.exporter.html_renderer.PAGE_SIZE", 2)
+    renderer = HtmlRenderer()
+    out = tmp_path / "big"
+    msgs = [_msg(i, 1700000000000 + i * 1000) for i in range(1, 6)]
+    renderer.render_session(out, Session(id="x", name="X"), msgs, {"messages": 5})
+    assert (out / "page_0001.html").exists()
+    assert (out / "page_0003.html").exists()
+    toc = (out / "index.html").read_text(encoding="utf-8")
+    assert "page_0001.html" in toc and "page_0003.html" in toc
+    page2 = (out / "page_0002.html").read_text(encoding="utf-8")
+    assert "page_0001.html" in page2 and "page_0003.html" in page2

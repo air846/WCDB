@@ -1,0 +1,17 @@
+{% extends "base.html.j2" %}
+{% block title %}{{ session.name }} · 聊天记录目录{% endblock %}
+{% block head_title %}{{ session.name|e }}{% endblock %}
+{% block content %}
+<p class="muted">共 {{ total_messages }} 条消息，分 {{ pages|length }} 页 · <a href="../index.html">← 返回会话列表</a></p>
+<table style="width:100%;border-collapse:collapse">
+  <tr style="text-align:left"><th>页码</th><th>时间范围</th><th>消息数</th><th></th></tr>
+  {% for p in pages %}
+  <tr>
+    <td>{{ loop.index }}</td>
+    <td>{{ p.start }} ~ {{ p.end }}</td>
+    <td>{{ p.count }}</td>
+    <td><a href="{{ p.name }}">打开</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

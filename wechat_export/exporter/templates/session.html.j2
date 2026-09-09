@@ -2,7 +2,13 @@
 {% block title %}{{ session.name }} · 聊天记录{% endblock %}
 {% block head_title %}{{ session.name|e }}{% endblock %}
 {% block content %}
-<p class="muted">{{ messages_count }} 条消息 · <a href="../index.html">← 返回会话列表</a></p>
+<p class="muted">{{ messages_count }} 条消息
+  {% if total_pages and total_pages > 1 %}· 第 {{ page_num }}/{{ total_pages }} 页{% endif %}
+  · <a href="../index.html">← 返回会话列表</a>
+  {% if prev_page %}· <a href="{{ prev_page }}">← 上一页</a>{% endif %}
+  {% if next_page %}· <a href="{{ next_page }}">下一页 →</a>{% endif %}
+  {% if total_pages and total_pages > 1 %}· <a href="index.html">目录</a>{% endif %}
+</p>
 {% for day, msgs in days %}
 <h3 class="muted">{{ day }}</h3>
 {% for m in msgs %}
