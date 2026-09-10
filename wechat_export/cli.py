@@ -18,8 +18,11 @@ from wechat_export.exporter.json_writer import (
     write_sessions_index,
 )
 from wechat_export.exporter.media_archive import MediaArchive, placeholder_media
+from wechat_export.emoji_fetch import EmojiFetcher
+from wechat_export.emoji_store import EmojiStore
 from wechat_export.image_decoder import (
-    WXGF_AVAILABLE, decode_dat, decode_raw_aes, decode_wxgf, global_xor_key,
+    WXGF_AVAILABLE, decode_dat, decode_raw_aes, decode_wxgf, decrypt_emoji,
+    detect_emoji_plain, global_xor_key,
 )
 from wechat_export.key_provider import KeyProvider, parse_key_hex
 from wechat_export.message_model import Media, Message, Session
@@ -68,8 +71,12 @@ class ExportReport:
     skipped: int = 0
     media_decoded: int = 0
     voice_decoded: int = 0
+    emoji_decoded: int = 0
+    emoji_fetched: int = 0
     errors: list[str] = field(default_factory=list)
     image_key_note: str = ""
+    emoji_note: str = ""
+    emoji_fetch_note: str = ""
     wxgf_note: str = ""
     voice_note: str = ""
 
@@ -89,6 +96,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--image-key", help="图片 AES 密钥（32位hex 或 16位ASCII）")
     p.add_argument("--image-key-scan", choices=["fast", "deep", "off"], default="fast",
                    help="图片密钥提取方式（默认 fast；未找到时可试 deep）")
+    p.add_argument("--emoji-key", help="表情 AES 密钥（32位hex 或 16位ASCII）")
+    p.add_argument("--emoji-key-scan", choices=["fast", "deep", "off"], default="fast",
+                   help="表情密钥提取方式（默认 fast；未找到时可试 deep）")
+    p.add_argument("--fetch-emoji", action="store_true",
+                   help="联网补下本机缺失的表情（默认关闭；仅访问微信 CDN）")
+    p.add_argument("--fetch-emoji-limit", type=int, default=200,
+                   help="联网补下表情的数量上限（默认 200）")
     p.add_argument("--no-media", action="store_true", help="跳过媒体归档")
     p.add_argument("--resume", action="store_true", help="跳过已完成会话（.done 标记）")
     return p.parse_args(argv)
@@ -162,6 +176,47 @@ def _load_image_key(args, samples: list[Path]) -> bytes | None:
     from wechat_export.image_key import extract_image_key
     try:
         return extract_image_key(samples, deep=(args.image_key_scan == "deep"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+EMOJI_MD5_RE = re.compile(r"^[0-9a-fA-F]{16,64}$")  # 同时防路径穿越与 glob 元字符
+
+
+def _emoji_samples(account_root: Path, limit: int = 60) -> list[Path]:
+    """表情样本（密钥 oracle）：Persist/Thumb 与 cache/<YYYY-MM>/Emoticon。"""
+    paths: list[Path] = []
+    bases = [account_root / "business" / "emoticon" / "Persist",
+             account_root / "business" / "emoticon" / "Thumb"]
+    cache = account_root / "cache"
+    if cache.is_dir():
+        bases += [m / "Emoticon" for m in sorted(cache.glob("????-??"))]
+    for base in bases:
+        if not base.is_dir():
+            continue
+        try:
+            paths += [p for p in base.glob("*/*")
+                      if p.is_file() and p.stat().st_size >= 64]
+        except OSError:
+            continue
+    try:
+        paths.sort(key=lambda p: p.stat().st_size)  # 小文件优先：oracle 只用首块
+    except OSError:
+        pass
+    return paths[:limit]
+
+
+def _load_emoji_key(args, account_root: Path, samples: list[Path]) -> bytes | None:
+    """手动 → 内存扫描（与 `_load_image_key` 同范式）；失败返回 None。"""
+    if args.emoji_key:
+        from wechat_export.emoji_key import parse_emoji_key
+        return parse_emoji_key(args.emoji_key)
+    if args.emoji_key_scan == "off" or not samples:
+        return None
+    from wechat_export.emoji_key import extract_emoji_key
+    try:
+        return extract_emoji_key(account_root, samples,
+                                 deep=(args.emoji_key_scan == "deep"))
     except Exception:  # noqa: BLE001
         return None
 
@@ -243,14 +298,22 @@ def _load_voice_index(db_storage: Path, keys: dict[str, str]) -> tuple[dict, dic
 class MediaResolver:
     def __init__(self, account_root: Path, archive: MediaArchive,
                  voice_index: dict, username_to_name2id: dict,
-                 image_key: bytes | None = None, xor_key: int | None = None):
+                 image_key: bytes | None = None, xor_key: int | None = None,
+                 emoji_key: bytes | None = None, emoji_store: EmojiStore | None = None,
+                 emoji_fetcher: EmojiFetcher | None = None):
         self.account_root = account_root
         self.archive = archive
         self.voice_index = voice_index
         self.username_to_name2id = username_to_name2id
         self.image_key = image_key
         self.xor_key = xor_key
+        self.emoji_key = emoji_key
+        self.emoji_store = emoji_store
+        self.emoji_fetcher = emoji_fetcher
+        self.emoji_fetched = 0
         self.decoded = 0
+        self.emoji_decoded = 0
+        self.emoji_pending = 0
         self.wxgf_pending = 0
         self.voice_decoded = 0
         self.voice_pending = 0
@@ -308,6 +371,17 @@ class MediaResolver:
         self._index = index
         return index
 
+    def _save_plain(self, plain: bytes, ext: str, kind: str, md5: str) -> Media:
+        """已解出明文的统一收尾：wxgf 转码 → 计数 → 归档。"""
+        if ext == ".wxgf":
+            converted = decode_wxgf(plain)
+            if converted is not None:
+                plain, ext = converted
+            elif not WXGF_AVAILABLE:
+                self.wxgf_pending += 1
+        self.decoded += 1
+        return self.archive.save_bytes(plain, kind, ext, md5=md5)
+
     def _archive_image(self, src: Path, kind: str, md5: str,
                        fallback_ext: str, try_raw_aes: bool = False) -> Media:
         """尝试解码 `.dat`/加密表情；失败则原样归档（保持旧行为）。"""
@@ -315,20 +389,64 @@ class MediaResolver:
             data = src.read_bytes()
         except OSError:
             return placeholder_media(Media(kind=kind, md5=md5))
+        if kind == "emoji":
+            if self.emoji_key:
+                plain = decrypt_emoji(data, self.emoji_key)
+                if plain is not None:
+                    self.emoji_decoded += 1
+                    fmt = detect_emoji_plain(plain)
+                    return self._save_plain(plain, fmt[1], kind, md5)
+            else:
+                self.emoji_pending += 1
         decoded = decode_dat(data, self.image_key, self.xor_key)
         if decoded is None and try_raw_aes:
             decoded = decode_raw_aes(data, self.image_key)
-        if decoded is not None:
-            plain, ext, _renderable = decoded
-            if ext == ".wxgf":
-                converted = decode_wxgf(plain)
-                if converted is not None:
-                    plain, ext = converted
-                elif not WXGF_AVAILABLE:
-                    self.wxgf_pending += 1
-            self.decoded += 1
-            return self.archive.save_bytes(plain, kind, ext, md5=md5)
-        return self.archive.save_bytes(data, kind, fallback_ext, md5=md5)
+        if decoded is None:
+            return self.archive.save_bytes(data, kind, fallback_ext, md5=md5)
+        plain, ext, _renderable = decoded
+        return self._save_plain(plain, ext, kind, md5)
+
+    def _emoji_store_plain(self, md5: str) -> tuple[bytes, str] | None:
+        """商店表情包容器切片（已解密明文 + 扩展名）；不可用返回 None。"""
+        if self.emoji_store is None:
+            return None
+        try:
+            plain = self.emoji_store.lookup(md5)
+        except Exception:  # noqa: BLE001
+            return None
+        if plain is None:
+            return None
+        fmt = detect_emoji_plain(plain)
+        return (plain, fmt[1]) if fmt is not None else None
+
+    def _emoji_fetch(self, media: Media) -> tuple[bytes, str] | None:
+        """可选联网补下（需 `--fetch-emoji`）：只在本地各来源都落空后尝试。"""
+        if self.emoji_fetcher is None or not media.cdn_url:
+            return None
+        try:
+            return self.emoji_fetcher.fetch(media.md5, media.cdn_url, media.aes_key)
+        except Exception:  # noqa: BLE001  # 网络异常不应中断导出
+            return None
+
+    def _find_emoji(self, md5: str) -> Path | None:
+        """多源查找：Persist（原图）→ cache（近期缓存，新月份优先）→ Thumb（缩略图）。"""
+        if not md5 or not EMOJI_MD5_RE.match(md5):
+            return None
+        base = self.account_root / "business" / "emoticon"
+        prefix = md5[:2]
+        cands = [base / "Persist" / prefix / md5]
+        cache = self.account_root / "cache"
+        if cache.is_dir():
+            cands += [m / "Emoticon" / prefix / md5
+                      for m in sorted(cache.glob("????-??"), reverse=True)]
+        cands.append(base / "Thumb" / prefix / f"{md5}.thumb")
+        for cand in cands:
+            try:
+                if cand.is_file() and cand.stat().st_size:
+                    return cand
+            except OSError:
+                continue
+        return None
 
     def resolve(self, media: Media, username: str, local_id: int) -> Media:
         if media.status != "ok":
@@ -365,15 +483,19 @@ class MediaResolver:
             result.duration_ms = media.duration_ms
             return result
         if media.kind == "emoji":
-            base = self.account_root / "business" / "emoticon"
-            persist = base / "Persist" / media.md5[:2] / media.md5
-            if persist.exists():
-                return self._archive_image(persist, "emoji", media.md5,
-                                           persist.suffix or ".bin", try_raw_aes=True)
-            thumb = base / "Thumb" / media.md5[:2] / (media.md5 + ".thumb")
-            if thumb.exists():
-                return self._archive_image(thumb, "emoji", media.md5,
-                                           ".thumb", try_raw_aes=True)
+            src = self._find_emoji(media.md5)
+            if src is not None:
+                return self._archive_image(src, "emoji", media.md5,
+                                           src.suffix or ".bin", try_raw_aes=True)
+            stored = self._emoji_store_plain(media.md5)
+            if stored is not None:
+                self.emoji_decoded += 1
+                return self._save_plain(stored[0], stored[1], "emoji", media.md5)
+            fetched = self._emoji_fetch(media)
+            if fetched is not None:
+                self.emoji_decoded += 1
+                self.emoji_fetched += 1
+                return self._save_plain(fetched[0], fetched[1], "emoji", media.md5)
             return placeholder_media(media)
         if not media.md5:
             return placeholder_media(media)
@@ -409,11 +531,18 @@ def _make_session(username: str, contacts: dict[str, str]) -> Session:
                    chat_type="group" if is_group else "single")
 
 
-def _needs_reexport(out_dir: Path, image_key: bytes | None) -> bool:
-    """上次导出缺少本次才具备的条件（格式版本/图片密钥/解码器）→ 值得重导。"""
+def _needs_reexport(out_dir: Path, image_key: bytes | None,
+                    emoji_key: bytes | None = None,
+                    emoji_store: bool = False,
+                    fetch_emoji_limit: int = 0) -> bool:
+    """上次导出缺少本次才具备的条件（格式版本/密钥/解码器）→ 值得重导。
+
+    只在**本次**具备某条件时才判重导（反向保护）：否则没拿到密钥的一轮会把上次
+    已解码的 `.gif`/`.jpg` 覆盖成 `.bin`，并被 `prune()` 清掉原图。
+    """
     from wechat_export.image_decoder import WXGF_AVAILABLE
 
-    if not image_key:
+    if not image_key and not emoji_key and not fetch_emoji_limit:
         return False
     try:
         stats = json.loads(
@@ -422,7 +551,15 @@ def _needs_reexport(out_dir: Path, image_key: bytes | None) -> bool:
         return False
     if stats.get("format_version", 0) < EXPORT_FORMAT_VERSION:
         return True
-    if not stats.get("image_key"):
+    if image_key and not stats.get("image_key"):
+        return True
+    if emoji_key and not stats.get("emoji_key"):
+        return True
+    if emoji_store and emoji_key and not stats.get("emoji_store"):
+        return True
+    # 记录的是"当时允许下载多少"，所以提高上限（想补更多）时值得重导；
+    # 用布尔值会永久跳过，导致 probe 过 3 个之后再也补不下别的。
+    if fetch_emoji_limit and stats.get("emoji_fetch_limit", 0) < fetch_emoji_limit:
         return True
     if WXGF_AVAILABLE and not stats.get("wxgf_available"):
         return True
@@ -497,6 +634,10 @@ def run_export(args: argparse.Namespace) -> ExportReport:
     account_root = account.db_storage.parent
     image_key = None
     xor_key = None
+    emoji_key = None
+    emoji_store = None
+    emoji_store_ok = False
+    fetcher = None
     if not args.no_media:
         samples = _image_samples(account_root)
         image_key = _load_image_key(args, samples)
@@ -509,6 +650,20 @@ def run_export(args: argparse.Namespace) -> ExportReport:
                     "微信仅在解码图片时把密钥加载到内存；"
                     "重跑可加 --resume（会自动重导未解码的会话），"
                     "或用 --image-key 手动提供（必要时加 --image-key-scan deep）。")
+        emoji_samples = _emoji_samples(account_root)
+        emoji_key = _load_emoji_key(args, account_root, emoji_samples)
+        if emoji_key is None and emoji_samples and args.emoji_key_scan != "off":
+            report.emoji_note = (
+                "未找到表情密钥，表情暂以 .bin 原样归档。"
+                "表情密钥常驻微信进程内存：请确认微信正在运行后重跑"
+                "（可加 --resume，会自动重导未解码的会话）；"
+                "或用 --emoji-key 手动提供（32 位 hex），"
+                "必要时加 --emoji-key-scan deep。")
+        emoji_store = EmojiStore(account_root, account.db_storage, keys, emoji_key)
+        emoji_store_ok = emoji_store.available()
+        if args.fetch_emoji:
+            fetcher = EmojiFetcher(out_root / "media", emoji_key,
+                                   limit=args.fetch_emoji_limit)
     done_sessions: list[Session] = []
     counts: dict[str, int] = {}
 
@@ -538,8 +693,10 @@ def run_export(args: argparse.Namespace) -> ExportReport:
                 continue
             out_dir = out_root / _safe_session_dir(username)
             skip = args.resume and (out_dir / ".done").exists()
-            if skip and _needs_reexport(out_dir, image_key):
-                skip = False  # 上次未解码，本次有图片密钥/av → 重新导出
+            if skip and _needs_reexport(out_dir, image_key, emoji_key,
+                                        emoji_store_ok,
+                                        args.fetch_emoji_limit if args.fetch_emoji else 0):
+                skip = False  # 上次未解码，本次有密钥/av → 重新导出
             if skip:
                 report.skipped += 1
                 session = _resume_session(out_dir) or _make_session(username, contacts)
@@ -566,11 +723,15 @@ def run_export(args: argparse.Namespace) -> ExportReport:
                 archive = MediaArchive(out_dir / "media")
                 resolver = MediaResolver(account_root, archive, voice_index,
                                          media_name2id, image_key=image_key,
-                                         xor_key=xor_key)
+                                         xor_key=xor_key, emoji_key=emoji_key,
+                                         emoji_store=emoji_store,
+                                         emoji_fetcher=fetcher)
                 ok, miss = _archive_media(msgs, resolver, username)
                 archive.prune()
                 report.media_decoded += resolver.decoded
                 report.voice_decoded += resolver.voice_decoded
+                report.emoji_decoded += resolver.emoji_decoded
+                report.emoji_fetched += resolver.emoji_fetched
                 if resolver.voice_pending and not report.voice_note:
                     report.voice_note = (
                         f"有 {resolver.voice_pending} 条语音未转码（.silk 原样归档）："
@@ -590,7 +751,15 @@ def run_export(args: argparse.Namespace) -> ExportReport:
                                 "media_missing": miss,
                                 "media_decoded": resolver.decoded if not args.no_media else 0,
                                 "voice_decoded": resolver.voice_decoded if not args.no_media else 0,
+                                "emoji_decoded": resolver.emoji_decoded if not args.no_media else 0,
                                 "image_key": bool(image_key),
+                                "emoji_key": bool(emoji_key),
+                                "emoji_store": emoji_store_ok,
+                                "emoji_fetch": fetcher is not None,
+                                "emoji_fetch_limit": (args.fetch_emoji_limit
+                                                      if fetcher is not None else 0),
+                                "emoji_fetched": (resolver.emoji_fetched
+                                                  if not args.no_media else 0),
                                 "wxgf_available": WXGF_AVAILABLE,
                                 "voice_available": VOICE_AVAILABLE,
                                 "format_version": EXPORT_FORMAT_VERSION})
@@ -605,13 +774,26 @@ def run_export(args: argparse.Namespace) -> ExportReport:
         for _, edb, _ in shards:
             edb.close()
 
+    if fetcher is not None:
+        if fetcher.downloaded:
+            report.emoji_fetch_note = (
+                f"联网补下 {fetcher.downloaded} 个表情（尝试 {fetcher.attempts}，"
+                f"失败 {fetcher.failed}）；原始响应缓存在 .emoji_cache，重跑不会重复下载。")
+        elif fetcher.attempts:
+            report.emoji_fetch_note = (
+                f"联网补下表情全部失败（{fetcher.failed} 次）：cdnurl 的 filekey 在消息"
+                "接收时签发，旧消息可能已失效。")
+        if fetcher.exhausted:
+            report.emoji_fetch_note += "已达 --fetch-emoji-limit 上限。"
     write_export_meta(out_root, {
         "account": account.wxid,
         "stats": {"sessions": report.sessions_done,
                   "messages": report.messages,
                   "media": {"ok": report.media_ok, "missing": report.media_missing,
                             "decoded": report.media_decoded,
-                            "voice_decoded": report.voice_decoded},
+                            "voice_decoded": report.voice_decoded,
+                            "emoji_decoded": report.emoji_decoded,
+                            "emoji_fetched": report.emoji_fetched},
                   "skipped": report.skipped},
     })
     write_sessions_index(out_root, done_sessions, counts)
@@ -635,6 +817,10 @@ def main(argv: list[str] | None = None) -> int:
               f"（其中解码 {report.media_decoded}），跳过 {report.skipped} 个")
         if report.image_key_note:
             print(f"提示：{report.image_key_note}", file=sys.stderr)
+        if report.emoji_note:
+            print(f"提示：{report.emoji_note}", file=sys.stderr)
+        if report.emoji_fetch_note:
+            print(f"提示：{report.emoji_fetch_note}", file=sys.stderr)
         if report.wxgf_note:
             print(f"提示：{report.wxgf_note}", file=sys.stderr)
         if report.voice_note:

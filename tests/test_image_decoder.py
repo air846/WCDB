@@ -235,6 +235,50 @@ def test_decode_raw_aes():
     assert decode_raw_aes(b"short", KEY) is None
 
 
+def test_detect_emoji_plain():
+    from wechat_export.image_decoder import detect_emoji_plain
+    assert detect_emoji_plain(b"wxam" + b"\x00" * 12) == ("wxam", ".wxam", False)
+    assert detect_emoji_plain(b"GIF89a...")[1] == ".gif"
+    assert detect_emoji_plain(b"not an image") is None
+
+
+def test_decrypt_emoji_roundtrip():
+    from tests.fixtures.emoji_factory import (
+        encrypt_emoji, gif_bytes, jpeg_bytes, png_bytes,
+    )
+    from wechat_export.image_decoder import decrypt_emoji, detect_emoji_plain
+
+    key = bytes(range(16))
+    cases = [(gif_bytes(), ".gif"), (png_bytes(), ".png"), (jpeg_bytes(), ".jpg"),
+             (WXGF_FIXTURE.read_bytes(), ".wxgf")]
+    for plain, ext in cases:
+        assert decrypt_emoji(encrypt_emoji(plain, key), key) == plain
+        assert detect_emoji_plain(plain)[1] == ext
+
+
+def test_decrypt_emoji_rejects():
+    from tests.fixtures.emoji_factory import encrypt_emoji, gif_bytes
+    from wechat_export.image_decoder import decrypt_emoji
+
+    key = bytes(range(16))
+    data = encrypt_emoji(gif_bytes(), key)
+    assert decrypt_emoji(data, b"\x00" * 16) is None      # 错密钥
+    assert decrypt_emoji(data, None) is None
+    assert decrypt_emoji(data, b"short") is None
+    assert decrypt_emoji(b"", key) is None
+    assert decrypt_emoji(data + b"\x01", key) is None     # 非 16 倍数
+    assert decrypt_emoji(b"\x00" * 8, key) is None        # 过短
+
+
+def test_decrypt_emoji_tolerates_missing_padding():
+    from wechat_export.image_decoder import decrypt_emoji
+
+    key = bytes(range(16))
+    plain = PNG_HEAD + b"\xaa" * 16                       # 32 字节，未带 PKCS7
+    data = AES.new(key, AES.MODE_CBC, key).encrypt(plain)
+    assert decrypt_emoji(data, key) == plain
+
+
 def test_parse_image_key():
     from wechat_export.cli import parse_image_key
     from wechat_export.exceptions import ConfigError

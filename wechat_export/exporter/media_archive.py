@@ -29,7 +29,7 @@ def placeholder_media(media: Media) -> Media:
 class MediaArchive:
     def __init__(self, media_root: Path):
         self.media_root = Path(media_root)
-        self._saved: set[tuple[str, str]] = set()
+        self._saved: set[tuple[str, str, str]] = set()
         self._files: set[str] = set()
         self.stats = {"saved": 0, "duplicated": 0, "missing": 0, "pruned": 0}
 
@@ -40,7 +40,8 @@ class MediaArchive:
         digest = md5 or _md5_of_bytes(data)
         rel_path = f"media/{kind_dir}/{digest}{ext}"
         self._files.add(f"{kind_dir}/{digest}{ext}")
-        if (kind_dir, digest) in self._saved:
+        # 去重键含 ext：同一 md5 换扩展名（如表情 .bin → .gif）不能复用旧 rel_path
+        if (kind_dir, digest, ext) in self._saved:
             self.stats["duplicated"] += 1
             return Media(kind=kind, md5=digest, size=len(data), ext=ext,
                          rel_path=rel_path)
@@ -57,7 +58,7 @@ class MediaArchive:
         except OSError:
             tmp.unlink(missing_ok=True)
             return None
-        self._saved.add((kind_dir, digest))
+        self._saved.add((kind_dir, digest, ext))
         self.stats["saved"] += 1
         return Media(kind=kind, md5=digest, size=len(data), ext=ext,
                      rel_path=rel_path)

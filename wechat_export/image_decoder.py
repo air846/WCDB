@@ -12,7 +12,11 @@
 
 旧版（V1 / 3.x）为整文件单字节 XOR，key 由文件头与图片 magic 反推。
 
-本模块只做纯解码，不接触进程内存；密钥提取见 `wechat_export.image_key`。
+表情（emoji）本地文件另有一套加密，见 `decrypt_emoji`：AES-128-CBC / IV=key / PKCS7，
+明文为 wxgf / GIF / PNG / JPEG。
+
+本模块只做纯解码，不接触进程内存；密钥提取见 `wechat_export.image_key`
+与 `wechat_export.emoji_key`。
 """
 
 import struct
@@ -194,8 +198,38 @@ def decode_wxgf(data: bytes, quality: int = 2) -> tuple[bytes, str] | None:
     return out, ".jpg"
 
 
+def detect_emoji_plain(data: bytes) -> tuple[str, str, bool] | None:
+    """表情明文识别：`detect_format` 之外再认 `wxam`（暂不可渲染）。"""
+    if data[:4] == b"wxam":
+        return "wxam", ".wxam", False
+    return detect_format(data)
+
+
+def decrypt_emoji(data: bytes, key: bytes | None) -> bytes | None:
+    """解密微信表情本地文件（AES-128-CBC / IV=key / PKCS7，整文件一条流）。
+
+    实测 4.1.13.63：`business/emoticon` 的 `Persist`/`Thumb`/`ThumbStore` 与
+    账号根 `cache/<YYYY-MM>/Emoticon` 下每个文件都是一条独立 CBC 流，IV 即密钥；
+    商店容器 `PersistStore` 是多个表情首尾相接的同一条流，须**整包解密后**按
+    `emoticon.db` 偏移切片（切片起点未必 16 对齐，不能单独解密）。
+
+    明文为 wxgf/GIF/PNG/JPEG 之一。密钥错误或非本格式返回 None，不抛异常。
+    """
+    if not key or len(key) not in (16, 24, 32) or len(data) < BLOCK or len(data) % BLOCK:
+        return None
+    try:
+        plain = AES.new(key, AES.MODE_CBC, key).decrypt(data)
+    except (ValueError, KeyError):
+        return None
+    try:
+        plain = Padding.unpad(plain, BLOCK)
+    except ValueError:
+        pass  # 个别文件可能未带 PKCS7，交由 magic 判定
+    return plain if detect_emoji_plain(plain) is not None else None
+
+
 def decode_raw_aes(data: bytes, aes_key: bytes | None) -> tuple[bytes, str, bool] | None:
-    """尝试整文件 AES-ECB（微信表情 Persist/Thumb 疑似同密钥加密）。"""
+    """尝试整文件 AES-ECB（旧版表情容错路径；4.1.13 起实际为 CBC，见 decrypt_emoji）。"""
     if not aes_key or len(aes_key) not in (16, 24, 32) or len(data) < 16:
         return None
     blocks = len(data) // BLOCK

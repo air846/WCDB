@@ -1,5 +1,11 @@
 """探测：从运行中的 Weixin.exe 内存中寻找微信表情（emoji）本地文件的 AES 密钥。
 
+**[已过时 / 历史工具]** 真实方案已于 2026-09-10 解出并在真机验证：密钥不是内存里的
+裸 16 字节，而是由账号级 seed 派生 —— `key = md5(f"{seed}{wxid}EMOTICON")[:16]`，
+密文是 **AES-128-CBC 且 IV = 密钥本身**。本脚本的 oracle 只做 AES-ECB（或把 IV 当成
+文件首块），因此永远 0 命中。现行实现见 `wechat_export/emoji_key.py`，算法说明见
+`docs/findings/emoji-format-notes.md`。保留本文件仅供追溯历史负结果。
+
 背景见 `docs/findings/emoji-format-notes.md`：
 - `business/emoticon/Persist/<md5>`、`Thumb/<md5>.thumb` 等文件均为分组加密
   （size % 16 == 0），浏览器无法直接显示；

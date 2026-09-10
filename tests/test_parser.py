@@ -66,6 +66,18 @@ def test_parse_emoji_media():
     assert media.md5 == "em123"
 
 
+def test_parse_emoji_media_carries_cdn_fields():
+    content = ('<msg><emoji md5="em123" '
+               'cdnurl="http://vweixinf.tc.qq.com/110/stodownload?m=em123" '
+               'aeskey="130e2f62736ae7916d9d9a6dd51fd49d" '
+               'productid="com.tencent.xin.emoticon.person.stiker_1" /></msg>')
+    media = parse_media_from_content(content, 47)
+    assert media.md5 == "em123"
+    assert media.cdn_url == "http://vweixinf.tc.qq.com/110/stodownload?m=em123"
+    assert media.aes_key == "130e2f62736ae7916d9d9a6dd51fd49d"
+    assert media.product_id == "com.tencent.xin.emoticon.person.stiker_1"
+
+
 def test_parse_voice_media():
     content = '<msg><voicemsg voicelength="3000" /></msg>'
     media = parse_media_from_content(content, 34)

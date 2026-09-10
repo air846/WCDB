@@ -28,7 +28,7 @@ class Session:
 
 @dataclass
 class Media:
-    kind: str  # image | video | voice | file
+    kind: str  # image | video | voice | file | emoji
     md5: str = ""
     size: int = 0
     ext: str = ""
@@ -36,12 +36,16 @@ class Media:
     status: str = "ok"  # ok | missing
     filename: str = ""
     duration_ms: int = 0
+    cdn_url: str = ""      # 表情：微信 CDN 地址（本机缺失时可选下载）
+    aes_key: str = ""      # 表情：消息自带的 per-sticker 密钥
+    product_id: str = ""   # 表情：所属商店表情包（非商店为空）
 
     def to_dict(self) -> dict:
         return {"kind": self.kind, "md5": self.md5, "size": self.size,
                 "ext": self.ext, "rel_path": self.rel_path,
                 "status": self.status, "filename": self.filename,
-                "duration_ms": self.duration_ms}
+                "duration_ms": self.duration_ms, "cdn_url": self.cdn_url,
+                "aes_key": self.aes_key, "product_id": self.product_id}
 
 
 @dataclass

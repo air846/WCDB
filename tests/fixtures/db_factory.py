@@ -106,6 +106,15 @@ def add_name(db_path: Path, *, key_hex: str = KEY, rowid: int, user_name: str,
     _with_plain(db_path, key_hex, fn)
 
 
+def exec_sql(db_path: Path, *, key_hex: str = KEY,
+             statements: list[tuple[str, tuple]] = ()) -> None:
+    """在加密库里执行任意 (sql, params) 列表（用于非消息类表的夹具）。"""
+    def fn(conn):
+        for sql, params in statements:
+            conn.execute(sql, params)
+    _with_plain(db_path, key_hex, fn)
+
+
 def add_session(db_path: Path, *, key_hex: str = KEY, username: str = "wxid_b") -> None:
     cols = ", ".join(f"{k} {v}" for k, v in MSG_COLUMNS.items())
 

@@ -102,6 +102,9 @@ def parse_media_from_content(content: str, base_type: int) -> Media | None:
         return None
     md5 = ""
     size = 0
+    cdn_url = ""
+    aes_key = ""
+    product_id = ""
     if kind == "image":
         el = _find(root, "img", ".//img")
         if el is None:
@@ -114,6 +117,10 @@ def parse_media_from_content(content: str, base_type: int) -> Media | None:
             return None
         md5 = el.get("md5", "")
         ext = ".gif"
+        # 本机没下载到的表情只有 cdnurl 可用（可选联网补下，见 emoji_fetch）
+        cdn_url = (el.get("cdnurl") or "").strip()
+        aes_key = (el.get("aeskey") or "").strip()
+        product_id = (el.get("productid") or "").strip()
     elif kind == "voice":
         el = _find(root, "voicemsg", ".//voicemsg")
         if el is None:
@@ -147,7 +154,8 @@ def parse_media_from_content(content: str, base_type: int) -> Media | None:
         return None
     duration_ms = size if kind == "voice" else 0
     return Media(kind=kind, md5=md5, size=size if kind != "voice" else 0,
-                 ext=ext, duration_ms=duration_ms)
+                 ext=ext, duration_ms=duration_ms, cdn_url=cdn_url,
+                 aes_key=aes_key, product_id=product_id)
 
 
 def media_file_id(packed_info) -> str:

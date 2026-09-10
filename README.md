@@ -24,6 +24,10 @@
   （也可 `--image-key` 手动提供）
 - **语音转码**：SILK 语音在安装可选依赖 `rsilk` 后自动转 24kHz WAV，HTML 内直接
   播放并显示时长；未安装时保留 `.silk` 下载链接
+- **表情/表情包解码**：微信 4.x 本地表情（`business/emoticon`）是 AES-128-CBC 加密
+  （IV = 密钥），密钥由账号级 seed 派生并自动从 `Weixin.exe` 进程内存提取；解密后
+  `wxgf` 转 JPEG、GIF/PNG 原样出图，商店表情包容器（`PersistStore`）按
+  `emoticon.db` 偏移切片还原，HTML 直接显示表情图片（也可 `--emoji-key` 手动提供）
 - **应用消息摘要**：`type=49` 的 appmsg XML 解析为可读卡片（引用/链接/文件/
   转账/红包/聊天记录/小程序/视频号/拍一拍等），JSON 保留原始 XML 并额外给出
   `appmsg` 结构化字段
@@ -64,6 +68,12 @@ wechat-export --out ./chat_export --image-key <32位hex>
 
 # 图片密钥自动提取失败时，可深度扫描进程内存（较慢）
 wechat-export --out ./chat_export --image-key-scan deep
+
+# 手动提供表情密钥（32位hex 或 16位ASCII；不传则自动从进程内存派生）
+wechat-export --out ./chat_export --emoji-key <32位hex>
+
+# 联网补下本机从未下载的表情（默认关闭；仅访问微信 CDN，原始响应缓存在 .emoji_cache）
+wechat-export --out ./chat_export --fetch-emoji --fetch-emoji-limit 200
 
 # 断点续导（跳过已完成的会话；若已拿到图片密钥，会自动重导含未解码图片的会话）
 wechat-export --out ./chat_export --resume
@@ -124,8 +134,11 @@ wechat-export --out ./chat_export --keys-file keys.json
 ## 合规边界
 
 - 仅支持导出**本机当前已登录账号**的数据；
-- 全程本机处理、只读打开原始库、**不写解密副本落盘**（解密明文仅驻内存）、不联网；
-- 密钥仅作为本机数据库访问钥匙使用；
+- 全程本机处理、只读打开原始库、**不写解密副本落盘**（解密明文仅驻内存）、**不联网**；
+- 唯一的例外是显式开启的 `--fetch-emoji`：它会用消息里自带的 `cdnurl` 访问微信
+  CDN 补下本机缺失的表情（仅允许 `qq.com` / `tencent.com` / `qpic.cn` / `wechat.com`
+  域名，串行 + 限流 + 落盘缓存），**默认关闭**；
+- 密钥仅作为本机数据库/媒体访问钥匙使用，只在内存中派生与使用、不落盘；
 - 导出结果包含个人隐私，请自行妥善保管，**不得用于外传或侵犯他人隐私**。
 
 ## 已知限制
@@ -135,8 +148,9 @@ wechat-export --out ./chat_export --keys-file keys.json
   需先在微信里**点开任意一张聊天图片**；否则请用 `--image-key` 手动提供
 - **wxgf 图片**：多数微信 4.x 整图是 wxgf（HEVC 容器），安装可选依赖 `av` 后会自动
   转成 JPEG；未安装或少数 HEIC 变体转码失败时保留 `.wxgf` 下载链接
-- **自定义表情**：`business/emoticon/Persist` 使用微信自有加密（与图片密钥不同），
-  暂未解码，以 `.bin` 原样归档
+- **表情/表情包**：本地已有的表情在微信运行时自动解密出图；**已卸载**的商店表情包
+  （`kStoreEmoticonFilesTable` 里没有的包）与**从未下载**的表情仍会显示为 `[表情]`
+  占位，后者可用 `--fetch-emoji` 尝试联网补下（旧消息的 `filekey` 可能已失效）
 - 视频/文件类媒体仅能归档已下载到本机的文件（视频按 `msg/video` 下文件 id、
   文件按 `msg/file` 下同名文件匹配）；未下载的标记 `missing`
 - 语音转 WAV 需要可选依赖 `rsilk`（PyPI 预编译轮子覆盖 Python 3.7–3.12；更高版本
@@ -150,6 +164,11 @@ wechat-export --out ./chat_export --keys-file keys.json
   一张图片，再 `wechat-export --out ./chat_export --resume`（会自动重导未解码会话），
   或 `--image-key` 手动提供；③ 若仍是 `.wxgf`，安装 `av` 后重跑
   （`pip install "wechat-export[wxgf]"`）
+- **表情显示为 `[表情]` 占位**：① 若 `media/emoji/` 下仍是 `.bin`，说明导出时没拿到
+  表情密钥——确认微信正在运行后 `wechat-export --out ./chat_export --resume`
+  （会自动重导未解码会话），或 `--emoji-key` 手动提供；② 若占位消息在 XML 里
+  `productid` 指向某个表情包，而该包在本机已卸载，则无法恢复；③ 其余从未下载的
+  表情可加 `--fetch-emoji` 联网补下
 - **语音播放不了**：安装可选依赖 `rsilk` 后重跑
   （`pip install "wechat-export[voice]"`），`--resume` 会自动重导并转成 `.wav`；
   若个别语音仍是 `.silk`，说明该条 SILK 已损坏/非标准，点击链接可下载原文件

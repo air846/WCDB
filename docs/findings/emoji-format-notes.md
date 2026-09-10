@@ -1,81 +1,109 @@
-# 表情（自定义表情包）本地文件格式与解密调查（2026-09-10）
+# 表情（自定义表情 / 表情包）本地文件格式与解密（2026-09-10）
 
-## 结论（当前）
+## 结论：已解出并在真机验证
 
-导出 HTML 中表情显示为 `[表情]` 下载链接而不是图片，是因为微信 4.x 的本地
-表情文件是**加密的自有容器**，工具当前只做了原样归档（`.bin`）。解密需要
-`emoji` 专用 AES 密钥，尚未定位到（见下）。**待微信运行时用内存扫描验证
-`wxam` 明文假设。**
+微信 4.x 的本地表情文件是 **AES-128-CBC 加密**，密钥由**账号级 seed** 派生：
+
+```
+key    = md5(f"{seed}{wxid}EMOTICON").digest()[:16]      # AES-128
+cipher = AES-128-CBC，IV = key，PKCS7，整文件一条流
+```
+
+- `seed`：账号级十进制数字串，微信启动后常驻进程内存。扫描 `\d{6,14}` 候选逐个
+  派生 + 验证，本机实测 **15 秒命中**（53k 候选）。
+- `wxid`：账号数据目录名去掉尾部 `_<4hex>`（`wxid_xxxxxxxx_1a2b` →
+  `wxid_xxxxxxxx`，与 `cli._self_wxid` 同一规则）。
+- 验证 oracle：把样本首块按 CBC 解出 `wxgf` / `GIF8` / `\x89PNG` / `\xff\xd8\xff`
+  即命中；再用整文件解密 + PKCS7 + magic 复核。
+
+**回归向量**（合成值，只用来冻结拼接顺序）：
+
+```
+seed = 1234567        wxid = wxid_demo
+key  = md5("1234567wxid_demoEMOTICON")[:16] = 943713aae3f94c28005cdb11c17d3b80
+```
+
+真机实测（4.1.13.63）：seed 是 10 位十进制串，`\d{6,14}` 扫全部候选 53k 个、
+15 秒命中，解出 `JFIF`/`\x89PNG`/`GIF89a` 明文。**真实 seed 与派生密钥同属本机
+运行时数据，不写入仓库**（与 `4x-reverse-notes.md` 的密钥处理约定一致）。
+
+密钥只在内存中使用、不落盘；实现见 `wechat_export/emoji_key.py`（提取）与
+`wechat_export/image_decoder.py:decrypt_emoji`（解密）。
+
+## 明文格式（实测分布，本机 245 个 Persist）
+
+| 目录 | 明文格式分布 |
+|---|---|
+| `Persist/<md5[:2]>/<md5>` | 220 `wxgf`（单视频流、单帧，静态 HEVC）+ 15 `GIF89a`（动画）+ 4 png + 6 jpeg |
+| `Thumb/<md5[:2]>/<md5>.thumb` | 154 jpeg + 91 png（缩略图，例 95×77） |
+| `ThumbStore/<md5(package_id)>` | png（多个 PNG 首尾相接） |
+| `PersistStore/<md5(package_id)>` | GIF 首尾相接（见下） |
+| `cache/<YYYY-MM>/Emoticon/<md5[:2]>/<md5>` | 35 个 `wxgf` |
+
+- 所有文件 `size % 16 == 0` 且 **PKCS7 填充校验全部通过** → 确认分组密码 + 填充。
+- 此前"首块只有 2 种取值"的现象有了正确解释：`Thumb` 里 jpeg 组的明文首块相同、
+  png 组另相同（154 / 91 恰好对应上表的 jpeg / png 数量），并非未知容器头。
+- 明文不是 `wxam`：`Persist` 里 220/245 是 **`wxgf`**，交给既有的
+  `image_decoder.decode_wxgf`（av → HEVC 首帧 → JPEG）即可直接出图。
+- `md5(明文) != 文件名`（文件名是服务端表情 md5），**不能靠哈希反查**，只能按
+  文件名/数据库映射定位。
 
 ## 文件布局（实测 4.1.13.63）
 
 ```
 business/emoticon/
-├── Persist/<md5[:2]>/<md5>              非商店表情全图（245 个，size%16==0）
-├── Thumb/<md5[:2]>/<md5>.thumb          非商店表情缩略图（245 个，size%16==0）
-├── PersistStore/<md5(package_id)>       商店表情包容器（7 个，按 offset 拼接）
-├── ThumbStore/<md5(package_id)>         商店表情包缩略图容器（含 .icon）
-cache/YYYY-MM/Emoticon/<md5[:2]>/<md5>   近期表情缓存（部分与 Persist 相同）
+├── Persist/<md5[:2]>/<md5>              非商店表情全图（245 个）
+├── Thumb/<md5[:2]>/<md5>.thumb          非商店表情缩略图（245 个）
+├── PersistStore/<md5(package_id)[:2]>/<md5(package_id)>   商店表情包容器（7 个）
+├── ThumbStore/<md5(package_id)[:2]>/<md5(package_id)>     商店包缩略图容器（+ .icon）
+└── Temp/                                空
+cache/YYYY-MM/Emoticon/<md5[:2]>/<md5>   近期表情缓存（在账号根，不在 business/ 下）
 ```
-
-- `PersistStore` 容器大小 == Σ `kStoreEmoticonFilesTable.emoticon_size_`（+16 对齐填充），
-  说明容器是逐个加密表情的直接拼接，无额外头。
-- `Persist`/`Thumb` 的 md5 与 `kNonStoreEmoticonTable.md5` 完全对应（242 + 3 额外）。
 
 ## 数据库（db_storage/emoticon/emoticon.db）
 
 - `kNonStoreEmoticonTable(type, md5, caption, product_id, aes_key, thumb_url, tp_url,
-  auth_key, cdn_url, extern_url, extern_md5, encrypt_url, designer_id, activity_id)`
+  auth_key, cdn_url, extern_url, extern_md5, encrypt_url, designer_id, activity_id)`（242 行）
 - `kStoreEmoticonFilesTable(package_id_, md5_, type_, sort_order_,
-  emoticon_size_, emoticon_offset_, thumb_size_, thumb_offset_)`
-- `kStoreEmoticonPackageTable(package_id_, ...)`；`PersistStore/<md5(package_id)>` 映射已验证。
+  emoticon_size_, emoticon_offset_, thumb_size_, thumb_offset_)`（128 行）
+- `kStoreEmoticonPackageTable(package_id_, ...)`（27 行）；
+  `PersistStore/<md5(package_id)>` 与已安装包的映射实测 **7/7 命中**。
 
-## 密文特征
+## 商店表情包容器（PersistStore）的关键性质
 
-| 目录 | 首 16 字节不同值 | 首 64 字节不同值 | 说明 |
-|---|---|---|---|
-| Thumb | **2**（`dbff9c15…` 154 个 / `e1bd6ecf…` 91 个） | 53（其中 153 个共享前 64B） | 固定头/同编码 JPEG 特征 |
-| Persist | 204 / 245 | 243 | 首块随文件变化 |
-| ThumbStore | 1 | 2 | 同 `e1bd…` |
-| 所有文件 size % 16 == 0 |  |  | 分组密码 + 填充 |
+容器**不是**每个表情各自加密后拼接，而是**整包一条连续 CBC 流**，明文就是包内
+各表情文件首尾相接。因此：
 
-## 已排除的算法（负结果）
+1. 整包解密后按 `emoticon_offset_` / `emoticon_size_` 切片；
+2. **不能单独解密某一刀**（IV 不是密钥、切片起点也未必 16 字节对齐）。
 
-在真实文件（含已知 `md5 ↔ aes_key` 对）上测试均未解出图片/wxam magic：
+实测包 `com.tencent.xin.emoticon.person.stiker_1762863369b8283ab711acd1ec`
+（容器 `md5(package_id)` = `12706a725520f8228c70013a75c3360e`，326560 B）：
+16 个切片**全部**以 `00 3b`（GIF trailer）结尾，且 `md5(切片) == md5_`（16/16 一致）。
+实现见 `wechat_export/emoji_store.py`。
+
+## 历史：已排除的算法（负结果，保留备查）
+
+早期把明文误猜为 `wxam` 且只试了 AES-ECB，因此 0 命中：
 
 1. `kNonStoreEmoticonTable.aes_key`（hex/ASCII/base64/md5 派生/反转）：
    AES-ECB / CBC（IV=0、首块、尾块、md5、key）/ CFB8 / CFB128 / OFB / CTR /
    GCM（多种 nonce/tag 布局）→ 无 magic。
 2. 图片全局密钥（含 `43e7d25eb1b9bb64`、`cfcd208495d565ef` 固定值）→ 无。
 3. 单字节 XOR / 多字节 XOR / zlib / bz2 / lzma / zstd 解压 → 无。
-4. 进程内存扫描（微信运行时）：
+4. 进程内存扫描（`tools/probe_emoji_key.py`）：
    - 字母数字 token 扫描（图片密钥提取同款）→ 无；
-   - 8/16 字节对齐 raw 扫描，oracle 为 Thumb 首块/C1/C4，validator 为
-     JFIF/Exif/GIF/PNG/zeros/wxgf → **0 候选**。
+   - 8/16 字节对齐 raw 扫描，oracle 为 Thumb 首块/C1/C4 → **0 候选**。
 
-## 关键线索（二进制字符串，Weixin.dll）
+   失败原因：真实方案是 **CBC 且 IV = 密钥本身**，而当时的 oracle 只做 ECB
+   （或把 IV 当成文件首块）。把 oracle 换成 `P_t = D_k(C_t) XOR k` 后立即可命中。
+   `tools/probe_emoji_key.py` 保留为历史工具，其 ECB 假设已过时。
 
-```
-emoticon file invalid / file read error / data decrypt key error / data decrypt failed
-emoticon md5 verify failed          ← 解密后校验 md5(明文)==文件名
-emoticon wxam data empty and no retry
-emoticon data encrypt key failed / data save error
-key to bytes error                  ← AesKey 字符串 → 字节
-encrypt emoticon data failed / write encrypt emoticon data failed
-AesKey (proto 字段) Caption ProductId CdnUrl ThumbUrl …
-```
+## 仍然存在的限制
 
-- `wxam` 出现在 Skia 编解码器 magic 表中（与 `heic` 并列），且 VoipEngine.dll
-  导出 `WxAMFrameEnc_Construct`；第三方 fuzzer 显示 WXAM 可解码为 JPEG/GIF。
-- **推测：Persist/Thumb 明文是 `wxam` 容器**（首 16/64 字节固定头，因此同 key
-  下密文首块相同）。此前内存扫描的 validator 没有包含 `wxam`，这是最可能的遗漏。
-- 本地文件解密密钥可能来自 `kNonStoreEmoticonTable.aes_key`（经某种包装），
-  或为全局 emoji 密钥（加载于显示表情时的进程内存）。
-
-## 下一步（需微信运行）
-
-1. 启动微信并**打开一次表情面板 / 点开任意自定义表情**（让密钥进内存）。
-2. 运行 `python tools/probe_emoji_key.py c0 8`（validator 已加入 `wxam`）。
-   若命中，记录 key 与模式，回填 `wechat_export/emoji_key.py` 与解码器。
-3. 解密成功后按 `wxam` → JPEG/GIF 转换（参照 `image_decoder.decode_wxgf`，
-   可能同样可用 `av`/HEVC），归档为图片并在 HTML 内嵌。
+- 商店包里**已卸载**的包无法恢复：本机 1189 条商店表情消息中，只有 19 个 md5 属于
+  当前已安装的包（`kStoreEmoticonFilesTable` 只覆盖已安装包）。
+- 本地从未下载的表情只有消息 XML 里的 `cdnurl`（`http://vweixinf.tc.qq.com/.../
+  stodownload?m=<md5>&filekey=...`，`filekey` 为接收时签发的签名）与 per-sticker
+  `aeskey`；可选联网补下见 `wechat_export/emoji_fetch.py`（默认关闭），旧消息的
+  `filekey` 可能已失效。

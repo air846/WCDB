@@ -3,4 +3,4 @@
 __version__ = "0.1.0"
 
 # 导出产物格式版本：影响 HTML/JSON 结构时递增，--resume 会据此重导旧会话。
-EXPORT_FORMAT_VERSION = 6
+EXPORT_FORMAT_VERSION = 7
