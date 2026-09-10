@@ -1,5 +1,7 @@
 # wechat-export — 微信 4.x 聊天记录全量导出
 
+> 仓库：<https://github.com/air846/WCDB> · 作者：[@air846](https://github.com/air846)
+
 从**本机已登录的 Windows 微信 4.x** 数据目录，解密聊天数据库并导出为
 **HTML 会话视图 + 结构化 JSON + 媒体文件**三件产物。纯本地处理，只读原库，
 不写解密副本落盘，不联网。

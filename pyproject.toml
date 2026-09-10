@@ -6,12 +6,21 @@ build-backend = "setuptools.build_meta"
 name = "wechat-export"
 version = "0.1.0"
 description = "Windows 微信 4.x 聊天记录全量导出工具（HTML + JSON + 媒体）"
+readme = "README.md"
+authors = [
+    { name = "air846", email = "222063493+air846@users.noreply.github.com" },
+]
 requires-python = ">=3.10"
 dependencies = [
     "pycryptodome>=3.20",
     "jinja2>=3.1",
     "zstandard>=0.22",
 ]
+
+[project.urls]
+Homepage = "https://github.com/air846/WCDB"
+Repository = "https://github.com/air846/WCDB"
+Issues = "https://github.com/air846/WCDB/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
