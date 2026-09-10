@@ -50,7 +50,7 @@ def strict_valid(pt: bytes) -> str | None:
 
 
 def _worker(args):
-    pid, base, size, oracles, stride = args
+    pid, base, size, oracles, stride, key_size = args
     found = []
     try:
         with RemoteProcess(pid) as proc:
@@ -61,11 +61,24 @@ def _worker(args):
                     offset += 0x1000
                     continue
                 aes = AES.new
-                for i in range(0, len(data) - 15, stride):
-                    key = data[i:i + 16]
+                for i in range(0, len(data) - key_size + 1, stride):
+                    key = data[i:i + key_size]
                     for name, oracle in oracles:
                         try:
-                            pt = aes(key, AES.MODE_ECB).decrypt(oracle)
+                            if name == "xiv":
+                                c0, c1 = oracle
+                                d1 = aes(key, AES.MODE_ECB).decrypt(c1)
+                                pt = bytes(a ^ b for a, b in zip(d1, c0))
+                            elif name == "pair":
+                                c0a, c0b = oracle
+                                da = aes(key, AES.MODE_ECB).decrypt(c0a)
+                                db = aes(key, AES.MODE_ECB).decrypt(c0b)
+                                xor = bytes(a ^ b for a, b in zip(da, db))
+                                if xor[:10] == b"\x00" * 10:
+                                    found.append((key.hex(), name, "same-prefix", xor.hex()))
+                                continue
+                            else:
+                                pt = aes(key, AES.MODE_ECB).decrypt(oracle)
                         except Exception:  # noqa: BLE001
                             continue
                         tag = strict_valid(pt)
@@ -77,7 +90,7 @@ def _worker(args):
     return found
 
 
-def full_check(key_hex: str, emoticon_dir: str) -> tuple | None:
+def full_check(key_hex: str, emoticon_dir: str, key_size: int = 16) -> tuple | None:
     """完整文件校验：PKCS7 unpad 后头/尾均为合法图片，或 `wxam` 容器。"""
     key = bytes.fromhex(key_hex)
     for root, _, fs in os.walk(f"{emoticon_dir}/Thumb"):
@@ -101,7 +114,22 @@ def full_check(key_hex: str, emoticon_dir: str) -> tuple | None:
     return None
 
 
-def build_oracles(emoticon_dir: str, which: str) -> list[tuple[str, bytes]]:
+def build_oracles(emoticon_dir: str, which: str, source: str = "thumb") -> list[tuple[str, bytes]]:
+    if source == "persist":
+        files = []
+        for root, _, fs in os.walk(f"{emoticon_dir}/Persist"):
+            for f in fs:
+                p = os.path.join(root, f)
+                if os.path.getsize(p) >= 128:
+                    files.append(p)
+        files.sort(key=os.path.getsize)
+        if not files:
+            raise SystemExit(f"Persist 目录为空：{emoticon_dir}/Persist")
+        with open(files[0], "rb") as fp:
+            head = fp.read(128)
+        names = ["c0", "c1", "c2"] if which == "all" else [which]
+        return [(f"persist-{n}", head[OFFSETS[n]:OFFSETS[n] + 16]) for n in names]
+
     pref = collections.Counter()
     for root, _, fs in os.walk(f"{emoticon_dir}/Thumb"):
         for f in fs:
@@ -110,6 +138,13 @@ def build_oracles(emoticon_dir: str, which: str) -> list[tuple[str, bytes]]:
     if not pref:
         raise SystemExit(f"Thumb 目录为空：{emoticon_dir}/Thumb")
     head = pref.most_common(1)[0][0]
+    if which == "xiv":
+        return [("xiv", (head[0:16], head[16:32]))]
+    if which == "pair":
+        heads = [h for h, _ in pref.most_common(2)]
+        if len(heads) < 2:
+            raise SystemExit("Thumb 首块分组不足 2 个，无法做 CBC 固定 IV 探测")
+        return [("pair", (heads[0][0:16], heads[1][0:16]))]
     names = ["c0", "c1", "c2", "c3", "c4", "c5"] if which == "all" else [which]
     oracles = []
     for name in names:
@@ -122,13 +157,18 @@ def build_oracles(emoticon_dir: str, which: str) -> list[tuple[str, bytes]]:
 def main() -> None:
     p = argparse.ArgumentParser(description="微信表情本地文件 AES 密钥内存探测")
     p.add_argument("--dir", required=True, help="business/emoticon 目录")
-    p.add_argument("--oracle", default="c0", choices=[*OFFSETS, "all"],
-                   help="Thumb 首块 oracle（默认 c0）")
+    p.add_argument("--oracle", default="c0", choices=[*OFFSETS, "all", "xiv", "pair"],
+                   help="Thumb oracle（c0..c5；xiv / pair 探测 CBC 固定 IV）")
+    p.add_argument("--source", default="thumb", choices=["thumb", "persist"],
+                   help="oracle 来源（默认 thumb）")
+    p.add_argument("--key-size", type=int, default=16, choices=[16, 24, 32],
+                   help="AES 密钥长度（默认 16）")
     p.add_argument("--stride", type=int, default=8, help="内存扫描步长（默认 8）")
     args = p.parse_args()
 
-    oracles = build_oracles(args.dir, args.oracle)
-    print("oracles:", [n for n, _ in oracles], "stride:", args.stride, flush=True)
+    oracles = build_oracles(args.dir, args.oracle, args.source)
+    print("oracles:", [n for n, _ in oracles], "stride:", args.stride,
+          "key-size:", args.key_size, flush=True)
     pids = find_weixin_pids()
     print("weixin pids:", pids, flush=True)
     if not pids:
@@ -140,7 +180,7 @@ def main() -> None:
             with RemoteProcess(pid) as proc:
                 for base, size in proc.regions():
                     if size > 0:
-                        tasks.append((pid, base, size, oracles, args.stride))
+                        tasks.append((pid, base, size, oracles, args.stride, args.key_size))
         except Exception as e:  # noqa: BLE001
             print("pid", pid, "regions ERR", e)
     print("regions:", len(tasks), flush=True)
@@ -159,7 +199,7 @@ def main() -> None:
                     continue
                 candidates.add(item)
                 print("CANDIDATE", item, flush=True)
-                fc = full_check(item[0], args.dir)
+                fc = full_check(item[0], args.dir, args.key_size)
                 if fc:
                     print("VALIDATED", item, fc, flush=True)
                     pool.terminate()
