@@ -1,0 +1,19 @@
+=== oracle=c0 stride=8 keysize=16 ===
+oracles: ['c0'] stride: 8 key-size: 16
+done 99s; candidates=0
+=== oracle=c1 stride=8 keysize=16 ===
+oracles: ['c1'] stride: 8 key-size: 16
+done 96s; candidates=0
+=== oracle=c4 stride=8 keysize=16 ===
+oracles: ['c4'] stride: 8 key-size: 16
+done 103s; candidates=0
+=== oracle=c0 stride=8 keysize=32 ===
+oracles: ['c0'] stride: 8 key-size: 32
+done 96s; candidates=0
+=== oracle=xiv stride=8 keysize=16 ===
+oracles: ['xiv'] stride: 8 key-size: 16
+done 134s; candidates=0
+=== oracle=pair stride=8 keysize=16 ===
+oracles: ['pair'] stride: 8 key-size: 16
+done 208s; candidates=0
+ALLDONE
